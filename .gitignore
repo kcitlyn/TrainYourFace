@@ -5,6 +5,3 @@ env/
 .env/
 ENV/
 
-# data for specific people
-faces_of_people/
-.faces_of_people/
