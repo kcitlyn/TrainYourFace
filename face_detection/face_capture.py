@@ -20,8 +20,7 @@ class Capture():
         self.face_recognition= FaceRecognition()
         
         self.properties_path_json= str(self.BASE_DIR / "face_data" / "face_properties.json")
-        with open(self.properties_path_json, "r") as people_data:
-            self.face_properties= json.load(people_data)
+        self.face_properties = utils.load_json_properties()
 
     def stream_frames(self):
         while True:
@@ -56,14 +55,23 @@ class Capture():
         )
 
     def get_registration_info(self):
-        #print a list of all the registered names thus far
-        self.given_name = ((input("What is the name of the person you want to register? (Note: you can only register one face in a single training session.)")).upper()).strip()
+        while True:
+            print("Registered names so far:", list(self.face_properties["faces"].keys()))
+            print("Note: if the face on camera is already registered but appears as unknown, identify that person exactly as you have registered previously")
+            print("this means that the face recognition needs more photo samples of your face")
+            self.given_name = ((input("What is the name of the person you want to register? ")).upper()).strip()
+            confirm = utils.prompt_choice(f"You entered '{self.given_name}'. Is this correct? (y/n): ", ["y", "n"])
+            if confirm == 'y':
+                break
+            else:
+                print("Reanswer the question please.\n")
+
         if self.given_name not in self.face_properties["faces"]:
-            answer = utils.prompt_choice("Do you want to register this persons voice? ", ["y", "n"])
+            answer = utils.prompt_choice("Do you want to register this persons face? (y/n) ", ["y", "n"])
             if answer == "y":
                 self.face_recognition.register_face(self.given_name, "initial reg")
             if answer == "n":
-                print("Registration declined. Exiting training image capture.")
+                print("Registration declined")
         else:
             self.face_recognition.register_face(self.given_name, "updating info")
     
@@ -73,24 +81,21 @@ class Capture():
                 thread = threading.Thread(target=self.get_registration_info())
                 thread.start()
                 thread.join()
-                with open(self.properties_path_json, "r") as people_data:
-                    self.face_properties = json.load(people_data)
+                self.face_properties = utils.load_json_properties()
             else:
                 self.given_name=face_name
-            
-            with open(self.properties_path_json, "w") as f:
-                json.dump(self.face_properties, f, indent=4)
+                self.face_recognition.register_face(self.given_name, "updating info")
 
-            with open(self.properties_path_json, "r") as f:
-                self.properties= json.load(f)
-
-            print(f"All face names: {list(self.face_properties['faces'].keys())}")
+            self.face_properties = utils.load_json_properties() #loads info from registering face
+            utils.write_json_properties(self.face_properties)
+            self.face_properties = utils.load_json_properties()
 
             photo_count = self.face_properties["faces"][self.given_name]["photo_count"]
+            print(photo_count)
             filename = f"{self.given_name}_{photo_count}.png"
             save_path = str(self.BASE_DIR / "face_data" / "faces" / self.given_name / f"{self.given_name}_unprocessed" / filename)
             cv2.imwrite(save_path, img)
             print("image saved into " + save_path)
             self.face_recognition.train_face_images() #after each image is taken it automatically trains the photo
-            print("face images being trained")
+            print("Face image(s) are being trained")
             

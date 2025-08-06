@@ -5,3 +5,5 @@ env/
 .env/
 ENV/
 
+face_descriptors.json
+face_properties.json

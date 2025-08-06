@@ -1,11 +1,9 @@
-import sys
 import os
-import glob
-import json
 from pathlib import Path
 import numpy as np
 import shutil
 
+from display import utils
 
 import dlib
 
@@ -23,17 +21,14 @@ class FaceRecognition():
         self.sp = dlib.shape_predictor(self.predictor_path)
         self.facerec = dlib.face_recognition_model_v1(self.face_rec_model_path)
         self.last_dets_count=0 #sets initial number of faces on window
-        #self.display_window = dlib.image_window()
 
         self.properties_path_json= str(self.BASE_DIR / "face_data" / "face_properties.json")
         self.descriptors_path_json= str(self.BASE_DIR / "face_data" / "face_descriptors.json")
-        with open(self.properties_path_json, "r") as people_data:
-            self.face_properties= json.load(people_data)
-        with open(self.descriptors_path_json, "r") as descriptors:
-            self.face_descriptors= json.load(descriptors)
+
+        self.face_descriptors = utils.load_json_descriptors()
+        self.face_properties = utils.load_json_properties()
     
     def register_face(self, face_name, purpose):
-        print("registering" + face_name + purpose)
         if purpose == "initial reg":
             self.relationship = input("what is this persons relationship to you? ")
             
@@ -43,21 +38,19 @@ class FaceRecognition():
             save_dir.mkdir(parents=True, exist_ok=True)  
             processed_dir.mkdir(parents=True, exist_ok=True)
             print(f"Making directory: {save_dir}")
+            if "faces" not in self.face_properties:
+                self.face_properties["faces"] = {}
             self.face_properties["faces"][face_name]={
                 "user_id": len(self.face_properties["faces"]),
                 "photo_count": 0,
                 "relationship": self.relationship
             }
             self.face_descriptors[face_name]=[]
-            
         elif purpose == "updating info":
             self.face_properties["faces"][face_name]["photo_count"]+=1
-
-        with open(self.properties_path_json, "w") as f:
-            json.dump(self.face_properties, f, indent=4)
-
-        with open(self.descriptors_path_json, "w") as f:
-            json.dump(self.face_descriptors, f, indent=4)
+            print("photo count added ", self.face_properties["faces"][face_name]["photo_count"])
+        utils.write_json_properties(self.face_properties)
+        utils.write_json_descriptors(self.face_descriptors)
 
     def get_face_descriptor(self, img):
         dets = self.detector(img, 1)
@@ -70,13 +63,12 @@ class FaceRecognition():
             for k, d in enumerate(dets):
                 shape = self.sp(img, d)
                 face_descriptor = self.facerec.compute_face_descriptor(img, shape)
-                return(face_descriptor, d)
+                return(face_descriptor, d, True)
         else:
-            return ("none", 0)
+            return (None, None, False)
 
-    def find_face_match(self, new_descriptor, threshold=0.6):
-        with open(self.descriptors_path_json, "r") as descriptors:
-            self.face_descriptors= json.load(descriptors)
+    def find_face_match(self, new_descriptor, threshold=0.3): #the lower the threshhold, the higher the accuracy
+        self.face_descriptors = utils.load_json_descriptors()
         best_match = None
         lowest_distance = float("inf")
         # json files the descriptors are stored in terms of a list, but the new descriptor is a dlib vector
@@ -96,9 +88,7 @@ class FaceRecognition():
             return None
 
     def train_face_images(self):
-        print("training faces begun")
-        with open(self.descriptors_path_json, "r") as descriptors:
-            self.face_descriptors= json.load(descriptors)
+        self.face_descriptors = utils.load_json_descriptors()
         for face_name in os.listdir(self.faces_folder_path):
             save_dir = self.BASE_DIR / "face_data" / "faces" / face_name / f"{face_name}_unprocessed"
             processed_dir = self.BASE_DIR / "face_data" / "faces" / face_name / f"{face_name}_processed"
@@ -113,8 +103,5 @@ class FaceRecognition():
                     face_chip = dlib.get_face_chip(img, shape)
                     descriptor = list(self.facerec.compute_face_descriptor(face_chip))
                     self.face_descriptors[face_name].append(descriptor)
-                    print("descriptor added to " + face_name)
                     shutil.move(str(img_path), str(processed_dir)) #moves newly processed photos to processed folder
-                    dlib.hit_enter_to_continue()
-            with open(self.descriptors_path_json, "w") as f:
-                json.dump(self.face_descriptors, f, indent=4)
+            utils.write_json_descriptors(self.face_descriptors)
