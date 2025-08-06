@@ -67,7 +67,7 @@ class FaceRecognition():
         else:
             return (None, None, False)
 
-    def find_face_match(self, new_descriptor, threshold=0.3): #the lower the threshhold, the higher the accuracy
+    def find_face_match(self, new_descriptor, threshold=0.4): #the lower the threshhold, the higher the accuracy
         self.face_descriptors = utils.load_json_descriptors()
         best_match = None
         lowest_distance = float("inf")

@@ -33,8 +33,8 @@ class DisplayManager:
                     self.capture.text_overlay(resized_frame, scaled_det, face_name)
                 else:
                     self.capture.text_overlay(resized_frame, scaled_det, "UNKNOWN")
-            if display_name == "training display":
-                self.capture.take_training_image(img, face_name)
+                if display_name == "training display":
+                    self.capture.take_training_image(img, face_name)
             cv2.imshow(display_name, resized_frame)
             if cv2.waitKey(1) & 0xFF == 27 : #esc key:
                 break

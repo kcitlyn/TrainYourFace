@@ -15,16 +15,19 @@ properties_path_json= str(BASE_DIR / "face_detection" / "face_data" / "face_prop
 descriptors_path_json= str(BASE_DIR / "face_detection" / "face_data" / "face_descriptors.json")
 
 def make_json_if_unavailable(specific_type):
-    if specific_type =="properties":
-        json_path=properties_path_json
+    if specific_type == "properties":
+        json_path = properties_path_json
+        initial_data = {"faces": {}}
     elif specific_type == "descriptors":
-        json_path=descriptors_path_json
+        json_path = descriptors_path_json
+        initial_data = {}
+
     if not os.path.exists(json_path):
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
         with open(json_path, 'w') as f:
-            json.dump({}, f)  # use [] if you want an array
-            print(f"Created new JSON file at {json_path}")
-    else:
-        print(f"JSON file already exists at {json_path}")
+            json.dump(initial_data, f, indent=4)
+        print(f"Created new JSON file at {json_path}")
+
 
 def load_json_descriptors():
     with open(descriptors_path_json, "r") as descriptors:
