@@ -1,9 +1,12 @@
-from face_detection.face_capture import Capture
-import cv2
-from face_detection.face_recognition import FaceRecognition
+from display import utils
 import json
 from pathlib import Path
-from display import utils
+import time
+
+import cv2
+
+from face_detection.face_capture import Capture
+from face_detection.face_recognition import FaceRecognition
 
 class DisplayManager:
     def __init__(self):
@@ -18,23 +21,29 @@ class DisplayManager:
         except (FileNotFoundError, json.JSONDecodeError, EOFError):
             print("face_descriptors.json is missing or invalid. Initializing as empty.")
             self.face_descriptors = {}
-            
+    
+    # relating to face identification
     def face_identifying_stream(self, display_name):
         for img in self.capture.stream_frames():
-            face_descriptor, det, state = self.recognizer.get_face_descriptor(img)
+            descriptors, state = self.recognizer.get_face_descriptor(img)
             resized_frame = cv2.resize(img, (640, 480)) # change according to your needs; the lower the res, the higher the fps
 
             if state:  # only if a face is detected
-                face_name = self.recognizer.find_face_match(face_descriptor)
-                scaled_det = Capture.scale_rectangle(det, img.shape, resized_frame.shape)
-                box_color= (212,255,228)
-                cv2.rectangle(resized_frame, (scaled_det.left(), scaled_det.top()), (scaled_det.right(), scaled_det.bottom()), box_color, 1)
-                if face_name is not None:
-                    self.capture.text_overlay(resized_frame, scaled_det, face_name)
-                else:
-                    self.capture.text_overlay(resized_frame, scaled_det, "UNKNOWN")
-                if display_name == "training display":
-                    self.capture.take_training_image(img, face_name)
+                 for face_descriptor, det in descriptors: #runs for each face found within display
+                    face_name = self.recognizer.find_face_match(face_descriptor)
+                    scaled_det = Capture.scale_rectangle(det, img.shape, resized_frame.shape)
+                    box_color= (212,255,228) #light green, change according to pref
+                    cv2.rectangle(resized_frame, (scaled_det.left(), scaled_det.top()), (scaled_det.right(), scaled_det.bottom()), box_color, 1)
+                    if face_name is not None:
+                        self.capture.text_overlay(resized_frame, scaled_det, face_name)
+                    else:
+                        self.capture.text_overlay(resized_frame, scaled_det, "UNKNOWN")
+                    if display_name == "training display":
+                        if len(descriptors)>1:
+                            print("face training only supports training one face at a time.")
+                            time.sleep(2)
+                        if len(descriptors)==1:
+                            self.capture.take_training_image(img, face_name)
             cv2.imshow(display_name, resized_frame)
             if cv2.waitKey(1) & 0xFF == 27 : #esc key:
                 break
@@ -44,6 +53,7 @@ class DisplayManager:
         print("IDENTIFICATION DISPLAY")
         print("press escape to exit this mode")
         self.face_identifying_stream("identification display")
+        #add something later with pyttsx3 perhaps with relationship stuff
 
     def training_display(self):
         print("TRAINING DISPLAY")

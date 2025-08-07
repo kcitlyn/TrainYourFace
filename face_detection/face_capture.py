@@ -1,11 +1,11 @@
-import dlib
+from display import utils
+from pathlib import Path
+import threading
+
 import cv2
-import json
+import dlib
 
 from face_detection.face_recognition import FaceRecognition
-from pathlib import Path
-from display import utils
-import threading
 
 class Capture():
     def __init__(self):

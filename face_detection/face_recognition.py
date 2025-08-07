@@ -1,11 +1,11 @@
+import numpy as np
 import os
 from pathlib import Path
-import numpy as np
 import shutil
 
-from display import utils
-
 import dlib
+
+from display import utils
 
 class FaceRecognition():
     def __init__(self):
@@ -55,17 +55,22 @@ class FaceRecognition():
     def get_face_descriptor(self, img):
         dets = self.detector(img, 1)
 
-        if len(dets) != self.last_dets_count:
+        # makes it so it only displays print message if there is a change in the number of faces on display
+        if len(dets) != self.last_dets_count: 
             print(f"Number of faces detected: {len(dets)}")
     
         self.last_dets_count=len(dets)
+        descriptors = []
         if dets:
-            for k, d in enumerate(dets):
+            for k, d in enumerate(dets): #d represents rectangular box coord for where the face is
                 shape = self.sp(img, d)
                 face_descriptor = self.facerec.compute_face_descriptor(img, shape)
-                return(face_descriptor, d, True)
+                descriptors.append((face_descriptor, d))
+        
+        if descriptors:
+            return (descriptors, True)
         else:
-            return (None, None, False)
+            return (descriptors, False)
 
     def find_face_match(self, new_descriptor, threshold=0.4): #the lower the threshhold, the higher the accuracy
         self.face_descriptors = utils.load_json_descriptors()

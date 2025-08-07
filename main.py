@@ -1,5 +1,6 @@
-from display import display_manager
 import cv2
+
+from display import display_manager
 from display import utils
 
 def main():
