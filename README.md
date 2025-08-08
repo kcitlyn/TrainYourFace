@@ -14,6 +14,19 @@ Relationship Metadata Support: Beyond recognition, assign and store contextual r
 
 ## ⚙️ Installation & Setup
 Requirements
+- Setup a virtual environment in main/root folder
+```
+python3 venv venv
+```
+- Activate the virtual environment 
+  - Windows
+```
+.\venv\scripts\activate
+```
+  - Linux/ Mac
+```
+source myenv/bin/activate
+```
 - Python 3.11.9 (or compatible earlier versions)
 - CMake (required for dlib compilation)
 ```
@@ -24,7 +37,7 @@ pip install cmake
   - Linux: GCC/G++
   - macOS: Xcode Command Line Tools
 
-## Model Weights
+### Model Weights
 Download the essential dlib models and place them in the face_detection/face_data/models/ directory:
 - shape_predictor_5_face_landmarks.dat.bz2
   - This can be downloaded from the following URL: [http://dlib.net/files/shape_predictor_5_face_landmarks.dat.bz2](http://dlib.net/files/shape_predictor_5_face_landmarks.dat.bz2)
@@ -32,11 +45,11 @@ Download the essential dlib models and place them in the face_detection/face_dat
   - This can be downloaded from the following URL: [http://dlib.net/files/dlib_face_recognition_resnet_model_v1.dat.bz2](http://dlib.net/files/dlib_face_recognition_resnet_model_v1.dat.bz2)
 Extract the .bz2 archives after downloading and move them to the proper folder.
 
-## Install Dependencies
+### Install Dependencies
 ```
 pip install -r requirements.txt
 ```
-## 🎯 Usage
+### 🎯 Usage
 Launch the program from the project root directory:
 ```
 python3 main.py
