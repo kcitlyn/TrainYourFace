@@ -67,10 +67,16 @@ train = [
     "matplotlib>=3.8",
     "tqdm>=4.66",
 ]
-# Export/benchmark toolchain. coremltools is macOS-relevant only, and onnx +
-# onnxruntime-tools give us graph surgery and INT8 quantization.
+# Export/benchmark toolchain. coremltools is macOS-relevant only; onnx gives us
+# graph surgery and INT8 quantization.
+#
+# onnxscript is not optional despite looking like an internal detail: torch >=2.6
+# routes torch.onnx.export through its dynamo-based exporter, which imports
+# onnxscript. Without it export dies with a bare ModuleNotFoundError deep inside
+# torch, which reads like a broken install rather than a missing extra.
 export = [
     "onnx>=1.16",
+    "onnxscript>=0.1",
     "coremltools>=8.0; sys_platform == 'darwin'",
 ]
 # The live webcam viewer needs real OpenCV with GUI support (cv2.imshow).
