@@ -22,19 +22,25 @@ We go further and also support splitting by capture SESSION, because the same
 subject photographed on two different days under different light is closer to two
 subjects than to one for this task.
 
-WHY THE DATASET IS BUILT, NOT DOWNLOADED
-----------------------------------------
-The standard academic PAD datasets (CASIA-FASD, Replay-Attack, OULU-NPU, SiW) all
-require signed institutional license agreements and are not redistributable. So
-this project cannot ship one, and pretending otherwise would make the results
-unreproducible.
+WHERE THE DATA COMES FROM
+-------------------------
+Two routes, and they answer different questions.
 
-Instead `tyf capture` records your own: bona-fide frames from the webcam, then
-print attacks (photo on paper) and replay attacks (photo/video on a phone
-screen). A few hundred frames across a handful of subjects and 2-3 capture
-sessions is enough to train a model that demonstrably works, and it is honest
-about what it is: a small self-collected dataset, with metrics reported on
-subject-disjoint splits.
+`tyf import-celeba` converts CelebA-Spoof (625K images, 10,177 subjects, direct
+download, no license application) into a manifest. This is the route to a real
+benchmark number. Most of the classic PAD datasets — CASIA-FASD, Replay-Attack,
+OULU-NPU, SiW — do require signed institutional agreements, which is why this
+project long assumed a public one didn't exist; CelebA-Spoof is the exception.
+
+`tyf capture` records your own from a webcam: bona-fide frames, then print
+attacks (photo on paper) and replay attacks (photo/video on a screen).
+
+The pair is worth more than either alone, because the honest question for a PAD
+model is not "how well does it score on the data it was built from" — every
+published model looks good there — but "does it survive a camera and a room it
+has never seen". Train on CelebA-Spoof, test on your own captures, and the drop
+between those two numbers is the result actually worth reporting. See
+`tyf eval --cross` for that protocol.
 """
 
 from __future__ import annotations
@@ -72,6 +78,16 @@ class Sample:
     # Free-form: "iphone13_screen", "laser_print_matte", etc. Reported per-type in
     # eval so we can say WHICH instrument defeats the model.
     instrument: str | None = None
+    # Free-form capture conditions, e.g. {"illumination": "back", "environment":
+    # "outdoor"}. Kept as an open dict rather than named fields because the
+    # interesting axes differ per dataset, and eval stratifies by whatever keys
+    # are present.
+    #
+    # This exists because a single aggregate APCER hides the failure that matters.
+    # A model at 3% overall can be at 30% in backlit conditions, and backlit is
+    # exactly where someone holds up a phone screen. Reporting per-condition is
+    # what turns "it works" into "here is where it stops working".
+    conditions: dict[str, str] = field(default_factory=dict)
 
     @property
     def label(self) -> int:
@@ -112,10 +128,32 @@ class DatasetManifest:
                 subject=s["subject"],
                 session=s.get("session", "default"),
                 instrument=s.get("instrument"),
+                conditions=s.get("conditions") or {},
             )
             for s in data.get("samples", [])
         ]
         return cls(samples=samples, root=data.get("root", ""))
+
+    def image_root(self, fallback: Path | str) -> Path:
+        """Where this manifest's relative paths actually resolve from.
+
+        The manifest records the tree its images live in, which is not always the
+        directory the manifest itself sits in. `tyf capture` writes both to the same
+        place, so the distinction never came up; `tyf import-celeba` writes a
+        manifest into your data dir while the 625K images stay in the CelebA
+        download, and copying them would be absurd.
+
+        Consumers used to assume `--data` was the image root, which meant an
+        imported manifest failed on the first image read with a path that didn't
+        exist — the manifest was right there and being ignored. Falls back to the
+        given directory when the recorded root is absent or stale, so a dataset
+        that was moved wholesale still works.
+        """
+        if self.root:
+            root = Path(self.root)
+            if root.exists():
+                return root
+        return Path(fallback)
 
     def counts(self) -> dict[str, int]:
         out: dict[str, int] = defaultdict(int)
