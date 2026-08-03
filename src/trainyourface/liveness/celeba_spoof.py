@@ -197,11 +197,26 @@ LABEL_LEN = 44
 def _subject_from_path(rel_path: str) -> str:
     """Pull the CelebA identity out of `Data/train/1234/live/000001.png`.
 
-    Returns the first path component that is all digits. The identity directory is
-    the only numeric component in the documented layout — `Data`, `train`, `live`,
-    and `spoof` are all words, and the filename has an extension.
+    The identity is STRUCTURALLY the directory whose child is `live` or `spoof` —
+    that is where CelebA-Spoof puts it, unambiguously. Preferred over "first
+    numeric component" because that heuristic is fragile: a path like
+    `Data/2020/train/55/live/1.png` has a year in it, and first-numeric would
+    return 2020, silently collapsing every subject into one group and destroying
+    the subject-disjoint guarantee with no error. Getting the subject wrong here
+    reopens exactly the leak the split code exists to prevent, so it is derived
+    from structure, not from a pattern that happens to usually hold.
+
+    Falls back to first-numeric only when there is no live/spoof directory, which
+    covers a hand-built manifest that doesn't follow the canonical layout.
     """
-    for part in Path(rel_path).parts[:-1]:
+    parts = Path(rel_path).parts
+    for i, part in enumerate(parts):
+        if part in ("live", "spoof") and i > 0:
+            parent = parts[i - 1]
+            if parent.isdigit():
+                return parent
+
+    for part in parts[:-1]:
         if part.isdigit():
             return part
     raise ValueError(
@@ -304,6 +319,13 @@ def convert(
     root = Path(root)
     if not root.exists():
         raise FileNotFoundError(f"no such directory: {root}")
+
+    # A non-positive limit is a mistake, not "keep this many". Left unchecked it
+    # falls through to `len(samples) >= limit`, which is true immediately, so the
+    # loop keeps zero samples and then raises "none of the images exist" — an error
+    # that blames the dataset for what is really a bad flag value.
+    if limit is not None and limit <= 0:
+        raise ValueError(f"--limit must be a positive number of samples, got {limit}")
 
     if label_file is None:
         label_file = root / "metas" / "intra_test" / "train_label.json"

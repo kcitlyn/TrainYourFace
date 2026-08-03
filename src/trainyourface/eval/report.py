@@ -26,6 +26,30 @@ from trainyourface.eval.metrics import apcer_bpcer, evaluate
 MIN_BUCKET = 20
 
 
+def _finite_scores(scores: np.ndarray, n_expected: int) -> np.ndarray:
+    """Validate a score array the same way the metrics layer does.
+
+    `evaluate()` and `apcer_bpcer()` already reject NaN, inf, and out-of-[0,1]
+    scores, so the normal `evaluate_test` path is covered — it calls them first.
+    But `stratify` and `fairness_audit` are public, exported, and tested on their
+    own, and a NaN reaches their `score < threshold` / `score >= threshold` tests
+    as a silent False. That understates the rate rather than erroring, which is the
+    precise failure mode the rest of this project refuses: a flattering wrong
+    number that looks like a result. So the guard is repeated at this boundary too.
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.shape[0] != n_expected:
+        raise ValueError(f"expected {n_expected} scores, got {scores.shape[0]}")
+    if scores.size and not np.all(np.isfinite(scores)):
+        raise ValueError("scores contain NaN or inf; cannot bucket a non-finite score")
+    if scores.size and (scores.min() < 0.0 or scores.max() > 1.0):
+        raise ValueError(
+            f"scores must be probabilities in [0, 1], got range "
+            f"[{scores.min():.4g}, {scores.max():.4g}]"
+        )
+    return scores
+
+
 def stratify(
     scores: np.ndarray,
     attack_types: list[AttackType],
@@ -48,12 +72,11 @@ def stratify(
     "live", not a real illumination reading), so a per-condition BPCER computed
     from this would be measuring the absence of a label.
     """
-    scores = np.asarray(scores, dtype=np.float64)
-    if not (len(scores) == len(attack_types) == len(conditions)):
+    if not (len(attack_types) == len(conditions)):
         raise ValueError(
-            f"misaligned inputs: {len(scores)} scores, {len(attack_types)} types, "
-            f"{len(conditions)} condition dicts"
+            f"misaligned inputs: {len(attack_types)} types, {len(conditions)} condition dicts"
         )
+    scores = _finite_scores(scores, len(attack_types))
 
     # axis -> value -> [n_attacks, n_accepted]
     buckets: dict[str, dict[str, list[int]]] = {}
@@ -127,12 +150,11 @@ def fairness_audit(
     MIN_FAIRNESS_GROUP report their count and no rate, because a bias claim from a
     handful of samples is worse than no claim.
     """
-    scores = np.asarray(scores, dtype=np.float64)
-    if not (len(scores) == len(attack_types) == len(conditions)):
+    if not (len(attack_types) == len(conditions)):
         raise ValueError(
-            f"misaligned inputs: {len(scores)} scores, {len(attack_types)} types, "
-            f"{len(conditions)} condition dicts"
+            f"misaligned inputs: {len(attack_types)} types, {len(conditions)} condition dicts"
         )
+    scores = _finite_scores(scores, len(attack_types))
 
     # attribute -> group value -> [n_bona_fide, n_rejected]
     groups: dict[str, dict[str, list[int]]] = {}
@@ -143,7 +165,11 @@ def fairness_audit(
         if attack_type.is_attack or not cond:
             continue
         for key, value in cond.items():
-            if not key.startswith("attr:"):
+            # `attr:` with a real name after it. A bare "attr:" carries no
+            # attribute and would create an unnamed "" group that renders as a
+            # blank row — the converter never writes one, but a hand-built manifest
+            # could, and a nameless demographic bucket is meaningless.
+            if not key.startswith("attr:") or len(key) <= len("attr:"):
                 continue
             slot = groups.setdefault(key[5:], {}).setdefault(str(value), [0, 0])
             slot[0] += 1
