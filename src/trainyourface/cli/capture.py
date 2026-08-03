@@ -26,6 +26,8 @@ detection and says so on screen when it isn't recording.
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from pathlib import Path
 
 import typer
@@ -60,6 +62,7 @@ def run_capture(
 
     from trainyourface.cli.loader import open_camera, require_gui
     from trainyourface.cli.overlay import draw_capture_hud
+    from trainyourface.cli.theme import GREEN, RED, corner_box
     from trainyourface.core.detect import FaceDetector
 
     require_gui()
@@ -83,9 +86,11 @@ def run_capture(
     saved = 0
     frame_index = 0
     window = f"tyf capture [{label.value}]"
+    fps_clock = deque(maxlen=30)
 
     try:
         while saved < target:
+            t0 = time.perf_counter()
             ok, frame = cap.read()
             if not ok:
                 typer.secho("camera read failed", fg=typer.colors.RED, err=True)
@@ -93,6 +98,7 @@ def run_capture(
 
             frame = cv2.flip(frame, 1)  # mirror: matches how people expect a webcam
             boxes, _ = detector.detect(frame)
+            small = [b for b in boxes if min(b.width, b.height) < MIN_FACE_PX]
             boxes = [b for b in boxes if min(b.width, b.height) >= MIN_FACE_PX]
             # One subject per frame. Two faces means the attack instrument and a
             # real person are both visible, which would be labeled wrong either way.
@@ -101,7 +107,17 @@ def run_capture(
             key = cv2.waitKey(1) & 0xFF
             recording = key == ord(" ")
 
-            if recording and box is not None and frame_index % stride == 0:
+            # Say specifically why a frame is being skipped, rather than only
+            # "no face". "Too small" and "two faces" need different fixes, and
+            # both silently produce a bad dataset if the user can't tell.
+            reason = None
+            if box is None and small:
+                reason = "face too small - move closer"
+            elif len(boxes) > 1:
+                reason = f"{len(boxes)} faces - only one subject per frame"
+
+            usable = box is not None and reason is None
+            if recording and usable and frame_index % stride == 0:
                 crop = crop_box(frame, box, size=INPUT_SIZE, margin=CROP_MARGIN)
                 name = f"{subject}_{session}_{label.value}_{existing + saved:05d}.png"
                 cv2.imwrite(str(images_dir / name), crop)
@@ -118,8 +134,25 @@ def run_capture(
                 )
                 saved += 1
 
+            view = frame.copy()
+            if box is not None:
+                color = GREEN if label == AttackType.BONA_FIDE else RED
+                corner_box(view, box, color, thickness=2)
+                # Show the actual saved crop region, not just the face box. The
+                # margin is a training-relevant choice (it's where bezels and
+                # paper edges live), so it should be visible while collecting.
+                m = int(min(box.width, box.height) * CROP_MARGIN)
+                cv2.rectangle(
+                    view,
+                    (box.x1 - m, box.y1 - m),
+                    (box.x2 + m, box.y2 + m),
+                    (110, 110, 116),
+                    1,
+                )
+
+            fps_clock.append(time.perf_counter() - t0)
             view = draw_capture_hud(
-                frame.copy(),
+                view,
                 label=label.value,
                 subject=subject,
                 session=session,
@@ -127,15 +160,15 @@ def run_capture(
                 target=target,
                 has_face=box is not None,
                 instrument=instrument,
+                recording=recording and usable,
+                reason=reason,
+                fps=len(fps_clock) / sum(fps_clock) if sum(fps_clock) > 0 else None,
             )
-            if box is not None:
-                color = (80, 220, 100) if label == AttackType.BONA_FIDE else (60, 60, 240)
-                cv2.rectangle(view, (box.x1, box.y1), (box.x2, box.y2), color, 2)
 
             cv2.imshow(window, view)
             frame_index += 1
 
-            if key == ord("q"):
+            if key in (ord("q"), 27):
                 break
     finally:
         cap.release()
