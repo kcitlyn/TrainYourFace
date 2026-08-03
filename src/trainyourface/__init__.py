@@ -32,3 +32,13 @@ def __getattr__(name: str):
 
         return getattr(api, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Make the lazily-exported names visible to dir() and autocomplete.
+
+    A module-level __getattr__ resolves the API but leaves it invisible to
+    `dir(trainyourface)`, so an IDE or a REPL user can't discover the three
+    public names without already knowing them. Listing __all__ restores that.
+    """
+    return sorted(__all__)

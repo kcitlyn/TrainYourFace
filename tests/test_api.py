@@ -199,9 +199,37 @@ class TestFairnessAudit:
         out = fairness_audit(scores, types, conds, threshold=0.5)
         assert "ratio" not in out["Eyeglasses"]
 
-    def test_misaligned_inputs_raise(self):
+    def test_misaligned_types_and_conditions_raise(self):
         with pytest.raises(ValueError, match="misaligned"):
+            fairness_audit(
+                np.array([0.1]),
+                [AttackType.BONA_FIDE],
+                [{}, {}],  # two conditions, one type
+                threshold=0.5,
+            )
+
+    def test_wrong_score_count_raises(self):
+        with pytest.raises(ValueError, match="expected 1 scores"):
             fairness_audit(np.array([0.1, 0.2]), [AttackType.BONA_FIDE], [{}], threshold=0.5)
+
+    def test_a_nan_score_raises_rather_than_undercounting(self):
+        """A NaN reaches `score >= threshold` as a silent False.
+
+        That would count a non-finite score as "not rejected" and understate
+        BPCER — a flattering wrong number, exactly what the metrics layer rejects
+        with a raise. This guard makes the public function behave the same way its
+        callers do, instead of only when reached through evaluate_test.
+        """
+        n = MIN_FAIRNESS_GROUP
+        scores = np.array([np.nan] + [0.1] * (n - 1))
+        with pytest.raises(ValueError, match="NaN or inf"):
+            fairness_audit(scores, [AttackType.BONA_FIDE] * n, [{"attr:Male": "yes"}] * n, 0.5)
+
+    def test_an_out_of_range_score_raises(self):
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            fairness_audit(
+                np.array([1.5] * 3), [AttackType.BONA_FIDE] * 3, [{"attr:Male": "yes"}] * 3, 0.5
+            )
 
 
 class TestFairnessRendering:
@@ -305,6 +333,17 @@ class TestPublicAPISurface:
 
         with pytest.raises(AttributeError, match="no attribute"):
             _ = trainyourface.NoSuchThing
+
+    def test_the_lazy_names_are_discoverable(self):
+        """A module __getattr__ resolves names but hides them from dir().
+
+        Without a __dir__, an IDE or REPL user can't discover the public API
+        without already knowing it, which defeats the point of a public API.
+        """
+        import trainyourface
+
+        listed = dir(trainyourface)
+        assert {"LivenessDetector", "FaceID", "TrustedFace"} <= set(listed)
 
 
 class TestTrustedFaceStates:

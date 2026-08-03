@@ -104,6 +104,26 @@ class TestSubjectFromPath:
         with pytest.raises(ValueError, match="subject-disjoint"):
             _subject_from_path("flat.png")
 
+    def test_a_numeric_component_before_the_identity_does_not_win(self):
+        """The bug the structural rule fixes.
+
+        A path like `Data/2020/train/55/live/1.png` has a year in it. The old
+        "first numeric component" heuristic returned 2020, which would collapse
+        every subject captured that year into one group — a random per-image split
+        wearing a subject-disjoint name, with no error. The identity is the parent
+        of live/spoof, so it is derived from structure rather than from a pattern
+        that usually holds.
+        """
+        assert _subject_from_path("Data/2020/train/55/live/1.png") == "55"
+        assert _subject_from_path("Data/2019/test/9/spoof/3.png") == "9"
+
+    def test_an_absolute_path_resolves(self):
+        assert _subject_from_path("/mnt/celeba/Data/train/77/live/1.png") == "77"
+
+    def test_a_non_canonical_layout_falls_back_to_first_numeric(self):
+        """A hand-built manifest without live/spoof dirs still works."""
+        assert _subject_from_path("images/42/photo.png") == "42"
+
 
 class TestParseLabel:
     def test_live_gets_no_conditions(self):
@@ -205,6 +225,18 @@ class TestConvert:
         # Every retained subject keeps its full complement of 4 images.
         assert set(counts.values()) == {4}
         assert len(m.samples) >= 8
+
+    def test_a_zero_limit_is_rejected_not_treated_as_empty(self, tmp_path):
+        """`--limit 0` used to fall through to "none of the images exist", blaming
+        the dataset for a bad flag. It names the flag now."""
+        root = write_celeba(tmp_path)
+        with pytest.raises(ValueError, match="--limit must be a positive"):
+            convert(root, limit=0, log=lambda *a: None)
+
+    def test_a_negative_limit_is_rejected(self, tmp_path):
+        root = write_celeba(tmp_path)
+        with pytest.raises(ValueError, match="--limit must be a positive"):
+            convert(root, limit=-5, log=lambda *a: None)
 
     def test_a_missing_root_is_an_error(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="no such directory"):
@@ -336,9 +368,24 @@ class TestStratify:
         )
         assert out["illumination"]["back"]["n"] == 1
 
-    def test_misaligned_inputs_raise(self):
+    def test_misaligned_types_and_conditions_raise(self):
         with pytest.raises(ValueError, match="misaligned"):
+            stratify(np.array([0.1]), [AttackType.REPLAY], [{}, {}], threshold=0.5)
+
+    def test_wrong_score_count_raises(self):
+        with pytest.raises(ValueError, match="expected 1 scores"):
             stratify(np.array([0.1, 0.2]), [AttackType.REPLAY], [{}], threshold=0.5)
+
+    def test_a_nan_score_raises_rather_than_undercounting(self):
+        """A NaN attack score reaches `score < threshold` as a silent False,
+        which would count it as "not accepted" and understate APCER."""
+        with pytest.raises(ValueError, match="NaN or inf"):
+            stratify(
+                np.array([np.nan] * 3),
+                [AttackType.REPLAY] * 3,
+                [{"illumination": "back"}] * 3,
+                threshold=0.5,
+            )
 
     def test_empty_conditions_produce_no_strata(self):
         out = stratify(np.array([0.9]), [AttackType.REPLAY], [{}], threshold=0.5)

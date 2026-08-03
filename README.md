@@ -89,15 +89,15 @@ Model weights download on first use and are cached. Nothing to place by hand.
 ```python
 from trainyourface import LivenessDetector, FaceID
 
-det = LivenessDetector()               # loads once, reuses the session
-result = det.check(frame)              # frame: HWC BGR uint8, e.g. from cv2
+det = LivenessDetector()  # loads once, reuses the session
+result = det.check(frame)  # frame: HWC BGR uint8, e.g. from cv2
 result.is_live, result.spoof_probability
 # (True, 0.02)
 
-fid = FaceID()                         # recognition gated behind liveness
-fid.enroll("kaitlyn", frame)           # raises rather than enroll from a photo
+fid = FaceID()  # recognition gated behind liveness
+fid.enroll("kaitlyn", frame)  # raises rather than enroll from a photo
 for face in fid.identify(frame):
-    print(face.status, face.name)      # TRUSTED kaitlyn
+    print(face.status, face.name)  # TRUSTED kaitlyn
 ```
 
 Two API decisions worth naming, both taken from watching users complain about the
@@ -288,7 +288,7 @@ the one worth quoting.
 ## Tests
 
 ```bash
-pytest                        # 390 tests
+pytest                        # 401 tests
 pytest -m train               # + the end-to-end run (trains a real model, ~3 min)
 pytest --cov=trainyourface    # 71% total
 ```
