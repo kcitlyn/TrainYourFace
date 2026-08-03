@@ -15,7 +15,8 @@ reasons specific to this task and this hardware:
 
 2. **Deployment target.** This has to run at 30fps alongside a detector and an
    embedder on a Raspberry Pi, and train on a 4 GB-VRAM laptop GPU. A ResNet50 at
-   128px doesn't fit that budget; this model is ~0.6M parameters.
+   128px doesn't fit that budget; this model is ~226K parameters at the default
+   width of 32.
 
 3. **Dataset size.** Self-collected PAD data is hundreds-to-thousands of images. A
    25M-parameter backbone on that much data memorizes subjects, which is precisely
