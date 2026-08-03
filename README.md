@@ -1,81 +1,227 @@
-# TrainMyFace
-TrainMyFace is a cutting-edge, terminal-driven face recognition and training system leveraging the powerful combination of OpenCV and dlib. Seamlessly capture, train, and identify faces in real-time — all from your webcam — with a streamlined and privacy-focused approach. Ideal for developers, researchers, and hobbyists passionate about computer vision and biometric identification.
+# TrainYourFace
 
-## 🚀 Features
-Robust Face Training & Recognition: Capture face images on the fly using the spacebar, automatically process and store facial descriptors, and perform accurate recognition in live video streams.
+**Face recognition that knows when it's being fooled.**
 
-Multi-Face Detection: Detect and identify multiple faces simultaneously with real-time bounding boxes and names displayed elegantly on-screen.
+Hold a photo of an enrolled person up to the camera. Most face recognition — including
+the first version of this project — will happily unlock. It matched the face, and a
+photo of a face is a face.
 
-Highly Scalable: Train an unlimited number of identities, managing face data and personal attributes with secure JSON storage — ensuring privacy and customization.
+That is the entire problem this project exists to solve. TrainYourFace trains a small
+PyTorch model to tell a live face from a printed photo or a phone screen, evaluates it
+with the ISO/IEC 30107-3 metrics used to report presentation-attack detection, and
+gates recognition behind it. A face is reported as **trusted** only when it is both
+recognized *and* verified live.
 
-Advanced Matching Algorithm: Employs Euclidean distance comparisons of 128-dimensional facial embeddings for precise and reliable identity matching.
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌─────────┐
+│  detect  │───▶│ liveness │───▶│ identify │───▶│ TRUSTED │
+└──────────┘    └────┬─────┘    └──────────┘    └─────────┘
+                     │ fails
+                     ▼
+                  ┌───────┐   recognition never runs
+                  │ SPOOF │   — the face is never embedded
+                  └───────┘
+```
 
-Relationship Metadata Support: Beyond recognition, assign and store contextual relationships (e.g., family ties) to enhance personal identification layers.
+Runs fully offline. No cloud, no API keys, no telemetry. `pip install trainyourface`
+with no compiler.
 
-## ⚙️ Installation & Setup
-Requirements
-- Setup a virtual environment in main/root folder
-```
-python3 venv venv
-```
-- Activate the virtual environment 
-  - Windows
-```
-.\venv\scripts\activate
-```
-  - Linux/ Mac
-```
-source myenv/bin/activate
-```
-- Python 3.11.9 (or compatible earlier versions)
-- CMake (required for dlib compilation)
-```
-pip install cmake
-```
-- A C++ build toolchain (common ones below):
-  - Windows: Visual Studio Build Tools
-  - Linux: GCC/G++
-  - macOS: Xcode Command Line Tools
+---
 
-### Model Weights
-Download the essential dlib models and place them in the face_detection/face_data/models/ directory:
-- shape_predictor_5_face_landmarks.dat.bz2
-  - This can be downloaded from the following URL: [http://dlib.net/files/shape_predictor_5_face_landmarks.dat.bz2](http://dlib.net/files/shape_predictor_5_face_landmarks.dat.bz2)
-- dlib_face_recognition_resnet_model_v1.dat.bz2
-  - This can be downloaded from the following URL: [http://dlib.net/files/dlib_face_recognition_resnet_model_v1.dat.bz2](http://dlib.net/files/dlib_face_recognition_resnet_model_v1.dat.bz2)
-Extract the .bz2 archives after downloading and move them to the proper folder.
+## Why this exists
 
-### Install Dependencies
+I wrote the original version as a webcam face-recognition tool, and it worked. Then I
+held up a photo of myself and it greeted me by name. That's not a bug in the matcher —
+the matcher was right. It's that "is this the right face" and "is there a person here"
+are two different questions, and only answering the first one produces a system that
+feels secure and isn't.
+
+So the project changed shape. Recognition is now the easy half. The interesting half
+is the liveness model, the metrics that say how much to trust it, and the plumbing
+that keeps a reported number honest.
+
+Three things also got fixed along the way that had nothing to do with spoofing and
+everything to do with the results being real:
+
+- **dlib is gone.** It required CMake and a C++ toolchain, which is the single most
+  common reason someone gives up on installing a CV project. Detection and embedding
+  now run on ONNX Runtime, and CI proves the install works on Linux/macOS/Windows ×
+  Python 3.10/3.13 with no compiler.
+- **A train/serve preprocessing mismatch.** Enrollment ran images through an aligned
+  crop; the live path used an unaligned one. Enrolled and live embeddings landed in
+  different regions of embedding space, so matching quietly degraded and the threshold
+  had to be cranked down to compensate. Nothing ever errored. Both paths now call one
+  normalization function, and a test asserts they agree byte-for-byte.
+- **`--seed` didn't work.** Training seeded torch and numpy and still produced a
+  different model every run, because the augmentation built an unseeded RNG on every
+  call. I found it when `train` reported 0% worst-case APCER and `eval` reported 12.5%
+  on what I thought was the same model. Augmentation is now seeded from
+  `(seed, epoch, index)`, so the result doesn't depend on DataLoader worker count or
+  the order workers pull indices. Two runs at the same seed now produce bit-identical
+  weights.
+
+That last one matters more than it looks. An unreproducible training run makes every
+metric unverifiable — not just by a reader, but by me.
+
+---
+
+## Install
+
+```bash
+pip install trainyourface          # inference: detect, enroll, recognize, liveness
+pip install 'trainyourface[demo]'  # + the live webcam window
+pip install 'trainyourface[train]' # + PyTorch, to train your own liveness model
+pip install 'trainyourface[export]'# + ONNX/CoreML export and quantization
 ```
-pip install -r requirements.txt
+
+Model weights download on first use and are cached. Nothing to place by hand.
+
+---
+
+## Use it
+
+```bash
+tyf enroll kaitlyn      # register a face (requires liveness — won't enroll a photo)
+tyf watch               # live recognition with liveness gating
+tyf info                # what's installed, which execution provider is active
 ```
-### 🎯 Usage
-Launch the program from the project root directory:
+
+`tyf watch` labels every face with one of four states:
+
+| State | Meaning |
+| --- | --- |
+| `TRUSTED` | Recognized **and** verified live. The only state that means anything. |
+| `SPOOF` | Liveness rejected it. Identity is deliberately not shown. |
+| `UNKNOWN` | Live person, not enrolled. |
+| `UNVERIFIED` | No liveness model loaded. Recognition only — **a photo will pass.** |
+
+Without a liveness model the tool says `UNVERIFIED`, never `TRUSTED`. A liveness check
+that defaults to pass is worse than no liveness check at all, because it looks like
+protection.
+
+---
+
+## Train your own liveness model
+
+The standard PAD datasets (CASIA-FASD, Replay-Attack, OULU-NPU, SiW) all need signed
+institutional licenses and can't be redistributed, so this ships a collector instead of
+a download link.
+
+```bash
+# Record yourself, then attacks against yourself. ~2 minutes each.
+tyf capture --label bona_fide --subject you --session day1
+tyf capture --label print     --subject you --session day1 --instrument laser_matte
+tyf capture --label replay    --subject you --session day1 --instrument iphone13
+
+tyf manifest                 # inspect what you've collected
+tyf train --epochs 30        # subject-disjoint split, evaluates test once
+tyf eval --markdown          # regenerate the metrics table below
+tyf export --format onnx     # verified against PyTorch on export
 ```
-python3 main.py
-```
-Choose between two interactive modes:
-- Training Mode: Capture and label face images. Press the spacebar to take snapshots for model training.
-- Identification Mode: Real-time detection and identification of faces with dynamic overlays showing recognized names.
-All facial data and metadata are securely saved in JSON files, created on the first run, ensuring full data privacy and user control.
 
-## 🙌 Credits
-This project stands on the shoulders of giants, powered by:
-- dlib: Industry-standard face detection and recognition.
-- OpenCV: Advanced computer vision and image processing library.
-Thank you to the open-source community for making these groundbreaking tools accessible.
+Capture 3+ subjects across 2+ sessions. The split refuses to run below 3 subjects
+rather than silently produce a test set that shares people with train.
 
-## 📄 License
-Licensed under the MIT License, granting you the freedom to use, modify, and distribute this project with minimal restrictions.
+### What the training pipeline refuses to do
 
-## 🔮 Future Personal Roadmap and Possibilities for Contributions
-- Text-to-Speech Integration: Announce recognized individuals audibly for enhanced accessibility and interactivity.
-- Rich Face Property Display: Add detailed contextual information and relationship tags for deeper personalization.
-- User-Friendly GUI: Develop a sleek graphical interface for effortless operation beyond the terminal.
-- More versatility for training options (for example, via file upload)
-  - (in the works)
+Every one of these is a way to get a better-looking number that means less:
 
-## 🤝 Contributing
-Contributions, feature requests, and bug reports are warmly welcomed! Whether you’re enhancing core functionality or polishing user experience, your input is invaluable and super exciting!
-Feel free to fork the repo, submit pull requests, or reach out directly via email or message for anything!
-If TrainMyFace has helped you at all or you enjoyed using it, please consider giving this repository a ⭐️!
+- **Split randomly by image.** A capture session yields hundreds of near-identical
+  frames. Split randomly and frame 41 goes to train while frame 42 goes to test — the
+  model scores ~99% by memorizing "this person in this room" and collapses on anyone
+  new. Splits are **subject-disjoint**, optionally session-disjoint, and integrity is
+  asserted after every split rather than assumed.
+- **Pick the threshold on test.** Extremely common and easy to do by accident. The
+  deployment threshold is chosen on **validation** and applied unchanged to test. Both
+  numbers get printed, because the gap between them is itself informative.
+- **Select checkpoints on accuracy.** On an attack-heavy set, accuracy rewards a model
+  that leans toward predicting "attack" — which looks fine and locks real users out.
+  Selection is on validation **EER**, which is threshold-free.
+- **Average APCER across attack types.** An attacker picks the attack, so the mean is
+  the wrong aggregate. **Worst-case APCER** is the headline number; the per-type
+  breakdown is reported alongside so you can say *which* instrument defeats the model.
+- **Report a latency without naming the provider.** ONNX Runtime silently falls back to
+  CPU. A number without an execution provider attached is unattributable, so `tyf
+  bench` always prints it — plus median and p95, never mean, because on an edge device
+  the tail is what breaks a frame budget.
+
+---
+
+## Measured results
+
+**Latency** — Apple M-series, ONNX Runtime CoreML execution provider, 200 timed
+iterations, 30 warmup excluded. Reproduce with `tyf bench --full-pipeline`.
+
+| Stage | Median | p95 | Notes |
+| --- | --- | --- | --- |
+| Liveness, batch 1 | 0.44 ms | 0.46 ms | 226K params, 1.0 MB ONNX |
+| Liveness, batch 16 | 4.42 ms | 4.81 ms | 0.28 ms per face amortized |
+| Detect, 1280×720 | 17.99 ms | 21.36 ms | SCRFD-500M |
+| Embed, 1 face | 1.37 ms | 3.00 ms | ArcFace w600k-MBF |
+
+Liveness costs ~2% of the frame budget. Detection dominates, which is the useful thing
+to know before optimizing anything.
+
+**Accuracy** — not yet measured on real data. The pipeline is verified end to end on a
+synthetic fixture, but that fixture is trivially separable and reports 0.00% on
+everything, so publishing it as a result would be meaningless. Real capture is the next
+step; `tyf eval --markdown` writes the table straight into this section so the numbers
+can't drift from the model that produced them.
+
+Metrics reported, per ISO/IEC 30107-3: **APCER** per attack type (attack frames wrongly
+accepted), **BPCER** (real users wrongly rejected), **ACER**, **EER**, and
+BPCER @ APCER ≤ 1%/5%/10% — because the operating point you'd actually deploy at is
+the one worth quoting.
+
+---
+
+## Design decisions worth defending
+
+**Liveness before recognition.** Two reasons, and the second is the real one: it skips
+the expensive half of the pipeline for rejected faces, and it stops the UI from
+printing "SPOOF — matched Kaitlyn", which tells an attacker their spoof found the right
+target. A test asserts rejected faces are never embedded, via a call counter.
+
+**Trust fails closed.** `is_trustworthy` requires a match *and* a passed liveness
+check. Missing liveness ⇒ untrusted. Enrollment exits non-zero rather than enroll from
+what might be a photo, and rejects faces that are too small or too blurry (Laplacian
+variance) — a soft enrollment embedding poisons every comparison made against it
+afterward.
+
+**The threshold travels with the model.** `train_summary.json` is copied alongside the
+exported weights, and inference records where its threshold came from. Otherwise the
+number in a report and the number the demo runs at diverge silently, which is the same
+class of bug as the preprocessing mismatch.
+
+**Export is verified, not assumed.** ONNX and CoreML outputs are checked against
+PyTorch over batch sizes 1, 1, and 4 — the repeat catches nondeterminism, and batch 4
+catches a dynamic axis that got frozen at export. FP32 must agree to 1e-4; INT8 gets a
+looser bound and prints the caveat that a quantized model is a *different* model whose
+metrics need re-measuring, not inheriting.
+
+**Augmentation chosen not to destroy the signal.** PAD cues are texture — moiré, print
+halftone, specular highlights. Heavy blur erases them, so blur stays mild. Aggressive
+color jitter can manufacture screen-like tints on genuine faces, teaching a cue that
+isn't there. JPEG recompression is deliberately *included*: real cameras deliver
+compressed frames, and training through that prevents a model that only works on
+pristine captures.
+
+---
+
+## Roadmap
+
+- [ ] Collect a real multi-subject, multi-session PAD dataset and publish the metrics
+- [ ] Raspberry Pi 4/5 deployment with measured latency, not projected
+- [ ] TensorRT INT8 path on NVIDIA, with accuracy re-measured post-quantization
+- [ ] Cutout and 3D-mask attack types (the schema already supports them)
+- [ ] Cross-dataset evaluation — train on one capture session, test on another entirely
+
+## Contributing
+
+The most useful contribution is **PAD data from a device or lighting condition I don't
+have**, or a report of an attack that gets through. Both are more valuable than
+features. Issues and PRs welcome.
+
+## License
+
+MIT.
