@@ -117,6 +117,12 @@ def _validate(scores: np.ndarray, is_attack: np.ndarray) -> tuple[np.ndarray, np
         raise ValueError("cannot compute PAD metrics on an empty score array")
     if not np.all(np.isfinite(scores)):
         raise ValueError("scores contain NaN or inf")
+    if scores.min() < 0.0 or scores.max() > 1.0:
+        raise ValueError(
+            f"scores must be probabilities in [0, 1], got range "
+            f"[{scores.min():.4g}, {scores.max():.4g}]. Apply softmax/sigmoid to "
+            "logits before computing PAD metrics."
+        )
     return scores, is_attack
 
 
@@ -144,6 +150,16 @@ def apcer_bpcer(
         raise ValueError(f"got {scores_arr.size} scores for {len(types)} labels")
     if not np.all(np.isfinite(scores_arr)):
         raise ValueError("scores contain NaN or inf")
+    # Probabilities, per the module docstring. Raw logits passed here by mistake
+    # produce a perfect-looking 0.00% APCER at a 0.5 threshold — every logit is
+    # either well above or well below it — which is a flattering wrong answer
+    # rather than an error, exactly what this module exists to prevent.
+    if scores_arr.size and (scores_arr.min() < 0.0 or scores_arr.max() > 1.0):
+        raise ValueError(
+            f"scores must be probabilities in [0, 1], got range "
+            f"[{scores_arr.min():.4g}, {scores_arr.max():.4g}]. Apply softmax/sigmoid "
+            "to logits before computing PAD metrics."
+        )
 
     types_arr = np.array([t.value for t in types])
     bona_mask = types_arr == AttackType.BONA_FIDE.value

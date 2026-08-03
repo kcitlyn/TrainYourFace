@@ -93,7 +93,14 @@ class EnrollmentStore:
         A corrupt store must not be fatal: the tool should still run and let the
         user re-enroll, which is why this warns and starts empty rather than
         raising. But it does NOT silently delete the bad file.
+
+        A *missing* file is not corruption — it's a fresh install. `tyf list` and
+        `tyf forget` call load() explicitly, so without this check the first thing
+        a new user saw was a warning that their enrollment store could not be read.
         """
+        if not self.path.exists():
+            return
+
         try:
             with np.load(self.path, allow_pickle=False) as data:
                 emb = data["embeddings"].astype(np.float32)
@@ -199,6 +206,17 @@ class EnrollmentStore:
         emb = np.atleast_2d(np.asarray(embeddings, dtype=np.float32))
         if emb.shape[1] != EMBEDDING_DIM:
             raise ValueError(f"expected {EMBEDDING_DIM}-D embeddings, got {emb.shape[1]}-D")
+        # Reject non-finite rows at the boundary. A NaN embedding stored here makes
+        # every subsequent similarity NaN, which fails pydantic's [-1, 1] bound on
+        # `Identity.similarity` and crashes the viewer one frame per face later —
+        # far from the enrollment that caused it. A NaN can reach here from a
+        # failed model load or a zero-variance crop, so it's checked, not assumed.
+        if not np.all(np.isfinite(emb)):
+            bad = int((~np.isfinite(emb).all(axis=1)).sum())
+            raise ValueError(
+                f"{bad} of {emb.shape[0]} embeddings contain NaN or inf; refusing to "
+                "store them because they would make every later match NaN"
+            )
         emb = l2_normalize(emb, axis=1)
 
         existing_idx = [i for i, n in enumerate(self._names) if n == name]
@@ -271,6 +289,12 @@ class EnrollmentStore:
         probe = l2_normalize(np.asarray(embedding, dtype=np.float32).ravel())
         sims = self._embeddings @ probe
 
+        # A non-finite probe (bad frame, failed model run) must be a non-match, not
+        # a crash: this runs once per face per frame in the live viewer, and a NaN
+        # similarity violates Identity's [-1, 1] bound. Fail closed — unknown.
+        if not np.all(np.isfinite(sims)):
+            return Identity(name=None, similarity=0.0, threshold=thr, database_empty=False)
+
         best = int(np.argmax(sims))
         best_sim = float(sims[best])
 
@@ -301,6 +325,11 @@ class EnrollmentStore:
         sims = l2_normalize(emb, axis=1) @ self._embeddings.T
         out: list[Identity] = []
         for row in sims:
+            # Same fail-closed rule as `identify`, per probe: one bad face in a
+            # frame must not take down the whole frame's recognition.
+            if not np.all(np.isfinite(row)):
+                out.append(Identity(name=None, similarity=0.0, threshold=thr))
+                continue
             best = int(np.argmax(row))
             best_sim = float(row[best])
             out.append(

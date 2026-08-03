@@ -99,12 +99,19 @@ class Box(BaseModel):
         The old code detected on the full-resolution frame but drew on a resized
         one, so this rescaling was load-bearing for the overlay lining up. Kept
         as an explicit method rather than inline arithmetic at each call site.
+
+        A small box scaled down rounds both edges to the same pixel, which would
+        fail Box's own x2 > x1 validator — so the result is widened to a minimum of
+        one pixel. Downscaling a detection is a legitimate operation and should not
+        raise just because the source box was tiny.
         """
+        x1, y1 = int(self.x1 * factor_x), int(self.y1 * factor_y)
+        x2, y2 = int(self.x2 * factor_x), int(self.y2 * factor_y)
         return Box(
-            x1=int(self.x1 * factor_x),
-            y1=int(self.y1 * factor_y),
-            x2=int(self.x2 * factor_x),
-            y2=int(self.y2 * factor_y),
+            x1=x1,
+            y1=y1,
+            x2=max(x2, x1 + 1),
+            y2=max(y2, y1 + 1),
             score=self.score,
         )
 

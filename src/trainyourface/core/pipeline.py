@@ -93,7 +93,19 @@ class FacePipeline:
         t1 = time.perf_counter()
         liveness_results: list = [None] * len(boxes)
         if self.liveness is not None:
-            liveness_results = self.liveness.check(frame, boxes)
+            scored = self.liveness.check(frame, boxes)
+            # A backend returning a different number of verdicts than boxes is a
+            # batching bug, and it must not become a wrong verdict. Everything
+            # downstream indexes results by box position, so a short list silently
+            # shifts one face's verdict onto another face — a spoof could be
+            # attributed to the live person beside it. Fail loudly instead.
+            if len(scored) != len(boxes):
+                raise RuntimeError(
+                    f"liveness backend returned {len(scored)} results for {len(boxes)} "
+                    "faces; verdicts are matched to faces by position, so a mismatch "
+                    "would assign the wrong verdict to a face"
+                )
+            liveness_results = list(scored)
         liveness_ms = (time.perf_counter() - t1) * 1000.0
 
         # ---- recognition ---------------------------------------------------
