@@ -288,9 +288,9 @@ the one worth quoting.
 ## Tests
 
 ```bash
-pytest                        # 401 tests
+pytest                        # 421 tests
 pytest -m train               # + the end-to-end run (trains a real model, ~3 min)
-pytest --cov=trainyourface    # 71% total
+pytest --cov=trainyourface    # 78% total
 ```
 
 The suite is organized around the failure modes rather than around the modules, because

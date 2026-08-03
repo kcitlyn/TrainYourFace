@@ -12,7 +12,21 @@ and only if they're real". Keeping those separate is the whole point — see
 
 from typing import TYPE_CHECKING
 
-__version__ = "0.2.0"
+# Read from installed package metadata rather than hardcoded, so pyproject.toml is
+# the single source of truth. Two hand-maintained copies drift: the release
+# workflow only checks the tag against pyproject.toml, so a bump that missed this
+# file would publish a wheel whose `pip show` version and `__version__` disagree —
+# permanently, since a PyPI version can never be re-uploaded.
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("trainyourface")
+except PackageNotFoundError:  # pragma: no cover - running from a source tree
+    # Not installed (e.g. a bare checkout on sys.path). A placeholder is correct
+    # here: there is no distribution to read a version from, and guessing one
+    # would be a claim about a package that isn't installed.
+    __version__ = "0.0.0+unknown"
 
 __all__ = ["LivenessDetector", "FaceID", "TrustedFace", "__version__"]
 

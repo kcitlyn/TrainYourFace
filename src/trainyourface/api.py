@@ -199,23 +199,21 @@ class FaceID:
             match_threshold=match_threshold,
         )
 
+    @staticmethod
+    def _to_trusted(f) -> TrustedFace:
+        """Project one internal FaceObservation onto the public shape."""
+        live, ident = f.liveness, f.identity
+        return TrustedFace(
+            box=(f.box.x1, f.box.y1, f.box.x2, f.box.y2),
+            name=getattr(ident, "name", None),
+            similarity=getattr(ident, "similarity", None),
+            is_live=None if live is None else live.is_live,
+            spoof_score=getattr(live, "spoof_probability", None),
+        )
+
     def identify(self, frame: np.ndarray) -> list[TrustedFace]:
         """Every face in the frame, with liveness and identity resolved."""
-        result = self.pipeline.process(frame)
-        out = []
-        for f in result.faces:
-            live = f.liveness
-            ident = f.identity
-            out.append(
-                TrustedFace(
-                    box=(f.box.x1, f.box.y1, f.box.x2, f.box.y2),
-                    name=getattr(ident, "name", None),
-                    similarity=getattr(ident, "similarity", None),
-                    is_live=None if live is None else live.is_live,
-                    spoof_score=getattr(live, "spoof_probability", None),
-                )
-            )
-        return out
+        return [self._to_trusted(f) for f in self.pipeline.process(frame).faces]
 
     def enroll(self, name: str, frame: np.ndarray) -> TrustedFace:
         """Register a face. Raises rather than enrolling something unverified.
@@ -225,26 +223,42 @@ class FaceID:
         matchable by that photo forever, and a soft or blurry embedding degrades
         every comparison made against it. So the checks here raise instead of
         warning.
+
+        ONE pipeline run drives both the liveness check and the stored embedding.
+        An earlier version called `identify()` for the check and then
+        `pipeline.process()` again to get the embedding, which is not merely
+        wasteful — it is a second, independent inference. The liveness verdict that
+        gated enrollment was then not the verdict belonging to the embedding
+        actually saved, so a borderline face could pass the gate on run one and be
+        stored on run two regardless. The check has to bind to the artifact.
         """
-        faces = self.identify(frame)
-        if not faces:
+        observations = self.pipeline.process(frame).faces
+        if not observations:
             raise ValueError("no face detected in the frame")
-        if len(faces) > 1:
+        if len(observations) > 1:
             raise ValueError(
-                f"{len(faces)} faces detected. Enrollment needs exactly one, "
+                f"{len(observations)} faces detected. Enrollment needs exactly one, "
                 "otherwise it is ambiguous which person is being registered."
             )
-        face = faces[0]
+
+        observation = observations[0]
+        face = self._to_trusted(observation)
         if self.require_liveness and face.is_live is not True:
             raise ValueError(
                 f"refusing to enroll: liveness says {face.status}. Enrolling from "
                 "what might be a photo would make that photo a valid credential."
             )
 
-        result = self.pipeline.process(frame)
-        embedding = result.faces[0].embedding
+        # Comes from the same run that produced the verdict above. When liveness
+        # rejects a face the pipeline never embeds it, so this is also None for a
+        # spoof — the require_liveness=False path has to handle that.
+        embedding = observation.embedding
         if embedding is None:
-            raise ValueError("face detected but not embedded; cannot enroll")
+            raise ValueError(
+                "face detected but not embedded, so there is nothing to enroll. "
+                "With require_liveness=False a face rejected by liveness is still "
+                "not embedded, which is the pipeline refusing to recognize a spoof."
+            )
         self.store.add(name, embedding)
         self.store.save()
         return face
@@ -258,4 +272,6 @@ class FaceID:
     @property
     def names(self) -> list[str]:
         """Enrolled identity names."""
-        return list(self.store.identities())
+        # `identities` is a property on EnrollmentStore, not a method. Calling it
+        # raised TypeError, which shipped because no test read this attribute.
+        return list(self.store.identities)
