@@ -236,6 +236,24 @@ def check_split_integrity(
             )
 
 
+def to_model_input(img: np.ndarray) -> np.ndarray:
+    """uint8 HWC BGR -> float32 CHW RGB in [-1, 1]. Returns (3, H, W), no batch dim.
+
+    This function exists so training and inference cannot drift apart. The
+    previous version of this project had exactly that bug in its recognition
+    path: enrollment ran images through an aligned crop while the live path used
+    an unaligned one, so enrolled and live embeddings landed in different regions
+    of embedding space and matching silently degraded. Nothing errored; the
+    threshold just had to be cranked down to compensate.
+
+    A train/serve preprocessing mismatch is invisible in tests that only exercise
+    one side, so both sides call this one function.
+    """
+    rgb = img[:, :, ::-1].astype(np.float32)
+    rgb = (rgb - 127.5) / 127.5
+    return np.ascontiguousarray(rgb.transpose(2, 0, 1))
+
+
 def load_image(path: str | Path, size: int = INPUT_SIZE) -> np.ndarray:
     """Read an image as a (size, size, 3) uint8 BGR array."""
     import cv2
@@ -261,14 +279,31 @@ class PADDataset:
         root: Path | str = "",
         train: bool = False,
         size: int = INPUT_SIZE,
+        seed: int = 0,
     ) -> None:
         self.samples = samples
         self.root = Path(root)
         self.train = train
         self.size = size
+        self.seed = seed
+        self.epoch = 0
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Advance the augmentation stream.
+
+        Augmentation is seeded from (seed, epoch, index), so it has to be told
+        which epoch it's in. Without this the same image would get the identical
+        augmentation every epoch, which defeats the point of augmenting.
+
+        The train loader is built with persistent_workers=False specifically so
+        worker processes are re-created each epoch and pick up this value; with
+        persistent workers, a mutation here would never reach the worker's copy of
+        the dataset and augmentation would silently freeze at epoch 0.
+        """
+        self.epoch = epoch
 
     def __getitem__(self, idx: int):
         import torch
@@ -278,15 +313,18 @@ class PADDataset:
         img = load_image(path, self.size)
 
         if self.train:
-            img = self._augment(img)
+            # Seeded from (seed, epoch, idx) rather than from global state, so a
+            # run is reproducible regardless of how many DataLoader workers are
+            # used or what order they happen to pull indices in. Worker count
+            # would otherwise change the augmentation each item receives, which
+            # makes --seed a promise the code doesn't keep.
+            img = self._augment(img, np.random.default_rng((self.seed, self.epoch, idx)))
 
-        # HWC uint8 BGR -> CHW float32 RGB in [-1, 1].
-        img = img[:, :, ::-1].astype(np.float32)
-        img = (img - 127.5) / 127.5
-        tensor = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
+        # Shared with the inference path — see to_model_input.
+        tensor = torch.from_numpy(to_model_input(img))
         return tensor, torch.tensor(s.label, dtype=torch.long)
 
-    def _augment(self, img: np.ndarray) -> np.ndarray:
+    def _augment(self, img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         """Augmentation chosen specifically NOT to destroy PAD cues.
 
         This is a real design constraint, not boilerplate. Standard image
@@ -303,8 +341,6 @@ class PADDataset:
           upside-down faces never occur at inference.
         """
         import cv2
-
-        rng = np.random.default_rng()
 
         if rng.random() < 0.5:
             img = img[:, ::-1]  # horizontal flip only

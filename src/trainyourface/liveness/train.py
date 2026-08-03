@@ -83,7 +83,12 @@ def _loader(dataset, batch_size: int, shuffle: bool, num_workers: int, seed: int
         # would raise during training.
         drop_last=shuffle,
         generator=generator if shuffle else None,
-        persistent_workers=num_workers > 0,
+        # Deliberately NOT persistent. Workers are forked per epoch so they pick
+        # up PADDataset.set_epoch(), which drives the augmentation seed. Persistent
+        # workers would keep a stale copy of the dataset and every epoch would see
+        # byte-identical augmented images. Costs a fork per epoch; buys actual
+        # augmentation and a reproducible run.
+        persistent_workers=False,
     )
 
 
@@ -141,7 +146,9 @@ def train(
     log(f"parameters: {n_params:,}")
     log(f"train: {len(train_samples)} samples | val: {len(val_samples)} samples")
 
-    train_ds = PADDataset(train_samples, root=root, train=True, size=cfg.model.input_size)
+    train_ds = PADDataset(
+        train_samples, root=root, train=True, size=cfg.model.input_size, seed=cfg.seed
+    )
     val_ds = PADDataset(val_samples, root=root, train=False, size=cfg.model.input_size)
 
     train_loader = _loader(train_ds, cfg.batch_size, True, cfg.num_workers, cfg.seed)
@@ -168,6 +175,8 @@ def train(
     for epoch in range(cfg.epochs):
         t0 = time.perf_counter()
         model.train()
+        # Drives the augmentation seed — see PADDataset.set_epoch.
+        train_ds.set_epoch(epoch)
         running, n_batches = 0.0, 0
 
         for x, y in train_loader:
