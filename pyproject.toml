@@ -1,0 +1,108 @@
+# Build/packaging config for the `trainyourface` package.
+#
+# PEP 621 layout with a `src/` src-layout (code in src/trainyourface/) so the
+# installed package — not the working directory — is what gets imported during
+# tests. Avoids the footgun where `import trainyourface` silently picks up the
+# source folder instead of the installed package.
+#
+# The dependency story here IS the product. The whole point of this project is
+# that `pip install trainyourface` works with no CMake, no C++ toolchain, and no
+# dlib — so the core deps are deliberately restricted to things that ship
+# prebuilt wheels on every platform we target (macOS arm64, Linux x86_64,
+# linux-aarch64 for Raspberry Pi). Torch is NOT a core dep: inference runs on
+# ONNX Runtime alone, and training lives behind the [train] extra.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trainyourface"
+version = "0.2.0"
+description = "Offline face recognition that knows when it's being fooled. No dlib, no CMake."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Kaitlyn Chen" }]
+keywords = [
+    "face-recognition",
+    "anti-spoofing",
+    "liveness-detection",
+    "presentation-attack-detection",
+    "onnx",
+    "edge-ai",
+    "coreml",
+    "offline",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Intended Audience :: Developers",
+]
+
+# Core = inference only, and every one of these has prebuilt wheels for
+# macOS arm64 / linux x86_64 / linux aarch64. No build step, ever.
+#   onnxruntime   -> runs both the detector/embedder and the liveness model
+#   opencv-*-headless -> camera + image ops WITHOUT pulling a GUI stack; the
+#                        optional live viewer upgrades this via the [demo] extra
+#   typer/pydantic -> CLI + validated data contracts (same pattern as edgedoctor)
+dependencies = [
+    "onnxruntime>=1.18",
+    "opencv-python-headless>=4.9",
+    "numpy>=1.24",
+    "typer>=0.26",
+    "pydantic>=2.7",
+    "platformdirs>=4.0",
+]
+
+[project.optional-dependencies]
+# Training the liveness model. Heavy, GPU-ish, and NOT needed to use the tool —
+# users consume the exported .onnx. Kept out of core so install stays fast.
+train = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "scikit-learn>=1.4",
+    "matplotlib>=3.8",
+    "tqdm>=4.66",
+]
+# Export/benchmark toolchain. coremltools is macOS-relevant only, and onnx +
+# onnxruntime-tools give us graph surgery and INT8 quantization.
+export = [
+    "onnx>=1.16",
+    "coremltools>=8.0; sys_platform == 'darwin'",
+]
+# The live webcam viewer needs real OpenCV with GUI support (cv2.imshow).
+# Installing this replaces the headless build.
+demo = ["opencv-python>=4.9"]
+
+[dependency-groups]
+# Dev tooling (uv installs these by default with `uv sync`).
+dev = ["pytest>=8", "ruff>=0.6", "pytest-cov>=5"]
+
+[project.scripts]
+trainyourface = "trainyourface.cli.main:main"
+tyf = "trainyourface.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trainyourface"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# E501 (line length) is handled by the formatter; B008 fights typer's
+# Argument()/Option() defaults, which are the documented idiom.
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Marks let CI skip anything needing a webcam, real model weights, or a GPU.
+markers = [
+    "slow: needs model weights or real hardware",
+    "camera: needs a physical webcam",
+    "train: needs the [train] extra (torch)",
+]
