@@ -22,7 +22,7 @@ THE ANNOTATION FORMAT
 `metas/intra_test/{train,test}_label.json` maps a relative image path to a
 44-element list:
 
-    [0:40]  the 40 CelebA face attributes (unused here)
+    [0:40]  the 40 CelebA face attributes, encoded +1/-1 (see FAIRNESS_ATTRIBUTES)
     [40]    spoof type    0=Live 1=Photo 2=Poster 3=A4 4=FaceMask
                           5=UpperBodyMask 6=RegionMask 7=PC 8=Pad 9=Phone 10=3DMask
     [41]    illumination  0=Live 1=Normal 2=Strong 3=Back 4=Dark
@@ -100,6 +100,94 @@ SPOOF_TYPE_NAME: dict[int, str] = {
 ILLUMINATION: dict[int, str] = {1: "normal", 2: "strong", 3: "back", 4: "dark"}
 ENVIRONMENT: dict[int, str] = {1: "indoor", 2: "outdoor"}
 
+# The 40 CelebA face attributes, in the canonical order of the dataset's own
+# list_attr_celeba.txt. Indices 0-39 of every label vector.
+#
+# Unlike the three spoof attributes above, these are present on LIVE images, which
+# is what makes a fairness audit possible at all: the harm a PAD model does to
+# real people is measured by BPCER (genuine users wrongly rejected), and BPCER
+# needs labels on bona-fide samples.
+CELEBA_ATTRIBUTES: tuple[str, ...] = (
+    "5_o_Clock_Shadow",
+    "Arched_Eyebrows",
+    "Attractive",
+    "Bags_Under_Eyes",
+    "Bald",
+    "Bangs",
+    "Big_Lips",
+    "Big_Nose",
+    "Black_Hair",
+    "Blond_Hair",
+    "Blurry",
+    "Brown_Hair",
+    "Bushy_Eyebrows",
+    "Chubby",
+    "Double_Chin",
+    "Eyeglasses",
+    "Goatee",
+    "Gray_Hair",
+    "Heavy_Makeup",
+    "High_Cheekbones",
+    "Male",
+    "Mouth_Slightly_Open",
+    "Mustache",
+    "Narrow_Eyes",
+    "No_Beard",
+    "Oval_Face",
+    "Pale_Skin",
+    "Pointy_Nose",
+    "Receding_Hairline",
+    "Rosy_Cheeks",
+    "Sideburns",
+    "Smiling",
+    "Straight_Hair",
+    "Wavy_Hair",
+    "Wearing_Earrings",
+    "Wearing_Hat",
+    "Wearing_Lipstick",
+    "Wearing_Necklace",
+    "Wearing_Necktie",
+    "Young",
+)
+
+# The subset worth auditing for disparate impact, and the reasoning for the cut is
+# the point rather than an implementation detail.
+#
+# INCLUDED because a PAD model treating these groups differently is a real harm:
+#   Male, Young, Pale_Skin  -- demographic proxies (see the caveat below)
+#   Eyeglasses, Wearing_Hat -- accessories a user cannot reasonably be asked to
+#                              remove at every unlock, and which occlude the face
+#   Heavy_Makeup, Wearing_Lipstick -- correlate strongly with gender presentation
+#                              and alter skin texture, which is the PAD cue itself
+#   Bald, Gray_Hair, No_Beard -- age and grooming proxies
+#
+# EXCLUDED deliberately:
+#   Attractive -- a subjective crowd annotation. Reporting a rate "by
+#                 attractiveness" would treat it as a real category, which is a
+#                 claim this project has no business making.
+#   Blurry     -- an image-quality attribute, not a property of the person. It
+#                 belongs in a robustness analysis, not a fairness one.
+#
+# THE CAVEAT THAT MATTERS: `Pale_Skin` is a binary crowd-sourced annotation, NOT a
+# validated skin-tone measurement. It is not Fitzpatrick, not the Monk scale, and
+# it collapses a continuum into one bit decided by an annotator. A disparity found
+# along it is a signal worth investigating, not a measured skin-tone bias, and
+# reporting it as the latter would be exactly the kind of overclaim the rest of
+# this project refuses. The honest version of this audit needs Monk-scale labels
+# that CelebA-Spoof does not have.
+FAIRNESS_ATTRIBUTES: tuple[str, ...] = (
+    "Male",
+    "Young",
+    "Pale_Skin",
+    "Eyeglasses",
+    "Wearing_Hat",
+    "Heavy_Makeup",
+    "Wearing_Lipstick",
+    "Bald",
+    "Gray_Hair",
+    "No_Beard",
+)
+
 # The label vector must be at least this long to index [43]. Checked rather than
 # assumed: a truncated or differently-versioned annotation file would otherwise
 # raise IndexError deep in the loop, naming a list index instead of a file.
@@ -123,12 +211,20 @@ def _subject_from_path(rel_path: str) -> str:
     )
 
 
-def parse_label(vec: list) -> tuple[AttackType, dict[str, str]]:
+def parse_label(vec: list, attributes: bool = False) -> tuple[AttackType, dict[str, str]]:
     """Turn one 44-element annotation vector into (attack_type, conditions).
 
     Raises ValueError on a vector this code doesn't understand, rather than
     defaulting. A mis-parsed label silently mislabels training data, and a PAD
     model trained on flipped labels still trains — it just reports nonsense.
+
+    Args:
+        attributes: also record the CelebA face attributes in FAIRNESS_ATTRIBUTES,
+            prefixed `attr:`. Prefixed rather than merged flat because these mean
+            something different from capture conditions — they describe the PERSON,
+            are present on live images, and are therefore the axis a BPCER
+            disparity is measured along. Merging them would put "was the subject
+            wearing glasses" in the same namespace as "was the screen backlit".
     """
     if len(vec) < LABEL_LEN:
         raise ValueError(
@@ -165,6 +261,16 @@ def parse_label(vec: list) -> tuple[AttackType, dict[str, str]]:
         if (env := ENVIRONMENT.get(int(vec[42]))) is not None:
             conditions["environment"] = env
 
+    if attributes:
+        # CelebA encodes these as +1 / -1, not 1 / 0. Testing `> 0` rather than
+        # truthiness matters: -1 is truthy in Python, so a naive bool() would
+        # label every attribute present on every face and produce a fairness
+        # report with one bucket per axis and no disparity anywhere — a clean
+        # bill of health manufactured by a sign error.
+        for name in FAIRNESS_ATTRIBUTES:
+            raw = vec[CELEBA_ATTRIBUTES.index(name)]
+            conditions[f"attr:{name}"] = "yes" if int(raw) > 0 else "no"
+
     return attack, conditions
 
 
@@ -173,6 +279,7 @@ def convert(
     label_file: Path | str | None = None,
     limit: int | None = None,
     session: str = "celeba",
+    attributes: bool = False,
     log=print,
 ) -> DatasetManifest:
     """Build a manifest from a downloaded CelebA-Spoof tree.
@@ -186,6 +293,9 @@ def convert(
             subject-disjoint-splittable and still has whole identities in it.
         session: recorded on every sample, so a later cross-dataset eval can tell
             CelebA samples from your own captures by session name.
+        attributes: record the CelebA face attributes for a fairness audit. Off by
+            default because it adds ~10 keys to every sample, which is dead weight
+            in a manifest nobody will audit.
 
     Skipped images are counted and reported rather than silently dropped: a
     converter that quietly ignores half the dataset produces a manifest whose size
@@ -241,7 +351,7 @@ def convert(
                 missing += 1
                 continue
             try:
-                attack, conditions = parse_label(vec)
+                attack, conditions = parse_label(vec, attributes=attributes)
             except ValueError:
                 bad_label += 1
                 continue

@@ -84,6 +84,36 @@ a dlib-based project.
 
 Model weights download on first use and are cached. Nothing to place by hand.
 
+## Use it as a library
+
+```python
+from trainyourface import LivenessDetector, FaceID
+
+det = LivenessDetector()               # loads once, reuses the session
+result = det.check(frame)              # frame: HWC BGR uint8, e.g. from cv2
+result.is_live, result.spoof_probability
+# (True, 0.02)
+
+fid = FaceID()                         # recognition gated behind liveness
+fid.enroll("kaitlyn", frame)           # raises rather than enroll from a photo
+for face in fid.identify(frame):
+    print(face.status, face.name)      # TRUSTED kaitlyn
+```
+
+Two API decisions worth naming, both taken from watching users complain about the
+alternative in the incumbent library:
+
+- **A spoof is a return value, not an exception.** Rejecting a presentation attack is
+  the normal operation of a PAD system, not an error condition. Making it raise forces
+  a `try/except` around the expected case.
+- **Models load in `__init__`.** Reloading per call is untenable in a video loop or a
+  server, which is the setting this gets used in.
+
+`FaceID()` **refuses to construct** without a liveness model rather than falling back to
+recognition-only. That fallback is available as `require_liveness=False`, and the error
+names it — but it has to be asked for, because the silent version means a photo passes
+on any machine where the model happens to be missing.
+
 ---
 
 ## Use it
@@ -118,9 +148,12 @@ with no license application, unlike CASIA-FASD / Replay-Attack / OULU-NPU / SiW,
 all need signed institutional agreements. Non-commercial research use, per its terms.
 
 ```bash
-tyf import-celeba ~/Downloads/CelebA_Spoof --limit 40000
+tyf import-celeba ~/Downloads/CelebA_Spoof --limit 40000 --attributes
 tyf train --epochs 30
 ```
+
+`--attributes` carries the CelebA face-attribute labels into the manifest, which is what
+makes the per-group BPCER audit below possible. It costs nothing at train time.
 
 **Your own camera.** The benchmark can't tell you whether the model survives *your*
 hardware.
@@ -198,6 +231,25 @@ Every one of these is a way to get a better-looking number that means less:
   data carries capture metadata, APCER is broken out per illumination and environment,
   worst bucket first. Buckets under n=20 print their raw count and *no rate*, because
   "2 of 3 missed" reads as a 67% finding and is noise.
+- **Report one BPCER for everybody.** A false rejection is a harm that lands on a
+  *user*, repeatedly, every time they try to unlock. If the model rejects one group
+  twice as often as another, that group experiences the product as broken while the
+  headline number looks fine. `tyf import-celeba --attributes` records the CelebA face
+  attributes, and eval reports **BPCER per group** with the worst/best ratio, flagging
+  anything past the four-fifths rule (the US EEOC's disparate-impact screen). Groups
+  under n=50 get no rate — a bias claim needs more evidence than a robustness one.
+
+### On the fairness audit's limits
+
+The demographic labels come from CelebA and are **binary crowd annotations**, not
+measurements. `Pale_Skin` in particular is one bit decided by an annotator — it is not
+Fitzpatrick, not the Monk scale, and it collapses a continuum. A disparity along it is a
+**signal worth investigating, not a measured skin-tone bias**, and the report says so
+next to the number every time it prints. `Attractive` is parsed but deliberately never
+audited: reporting rates by it would treat a subjective annotation as a real category.
+
+This is a screening tool that tells you where to look. It is not a bias certification,
+and the honest version of this analysis needs skin-tone labels this dataset doesn't have.
 
 ---
 
@@ -236,7 +288,7 @@ the one worth quoting.
 ## Tests
 
 ```bash
-pytest                        # 304 tests
+pytest                        # 390 tests
 pytest -m train               # + the end-to-end run (trains a real model, ~3 min)
 pytest --cov=trainyourface    # 71% total
 ```

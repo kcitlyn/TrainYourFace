@@ -235,6 +235,10 @@ def import_celeba(
     limit: int = typer.Option(
         None, help="Cap the sample count. Samples whole subjects, not random images."
     ),
+    attributes: bool = typer.Option(
+        False,
+        help="Record CelebA face attributes so `tyf eval` can audit BPCER by group.",
+    ),
 ) -> None:
     """Convert a downloaded CelebA-Spoof dataset into a manifest.
 
@@ -246,7 +250,13 @@ def import_celeba(
     from trainyourface.liveness.celeba_spoof import convert
 
     try:
-        m = convert(root, label_file=label_file, limit=limit, log=typer.echo)
+        m = convert(
+            root,
+            label_file=label_file,
+            limit=limit,
+            attributes=attributes,
+            log=typer.echo,
+        )
     except (FileNotFoundError, ValueError) as exc:
         typer.secho(f"import failed: {exc}", fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc

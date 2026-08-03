@@ -61,6 +61,13 @@ def stratify(
         if not attack_type.is_attack or not cond:
             continue
         for axis, value in cond.items():
+            # `attr:` keys describe the PERSON and belong to the fairness audit,
+            # which measures BPCER. Bucketing them here would put "APCER among
+            # people wearing glasses" in the capture-condition table — a real
+            # number, but one that answers a question nobody asked and reads as a
+            # demographic finding while actually being about attack samples.
+            if axis.startswith("attr:"):
+                continue
             slot = buckets.setdefault(axis, {}).setdefault(str(value), [0, 0])
             slot[0] += 1
             slot[1] += int(score < threshold)  # accepted as bona fide == missed attack
@@ -74,6 +81,97 @@ def stratify(
             # rather than printed with a caveat nobody reads.
             entry["apcer"] = (accepted / n) if n >= MIN_BUCKET else None
             out[axis][value] = entry
+    return out
+
+
+# Below this many bona-fide samples in a group, a BPCER is not worth reporting.
+# Higher than MIN_BUCKET because a fairness claim carries more weight than a
+# robustness observation, and "this model is biased" off n=25 is irresponsible.
+MIN_FAIRNESS_GROUP = 50
+
+# A ratio at or above this between the worst and best group's BPCER gets flagged.
+# 1.25 is the US EEOC's four-fifths rule inverted (4/5 = 0.8, 1/0.8 = 1.25) — an
+# established legal threshold for disparate impact rather than a number picked to
+# make the output look good. It is a screening heuristic, not a finding.
+DISPARATE_IMPACT_RATIO = 1.25
+
+
+def fairness_audit(
+    scores: np.ndarray,
+    attack_types: list[AttackType],
+    conditions: list[dict],
+    threshold: float,
+) -> dict:
+    """BPCER per demographic group — who gets wrongly locked out, and how unevenly.
+
+    WHY BPCER AND NOT APCER
+    -----------------------
+    This is the opposite axis from `stratify`, on purpose. APCER measures attacks
+    that got through: the harm lands on whoever owns the account. BPCER measures
+    real people wrongly rejected: the harm lands on the *user*, and it lands
+    repeatedly, every time they try to unlock. If a PAD model rejects one group
+    twice as often as another, that group experiences the product as broken.
+
+    Face biometrics have a well-documented history here — NIST FRVT measures
+    demographic differentials, and the EU AI Act requires bias assessment for
+    biometric systems. PAD-specific disparity is far less studied than recognition
+    disparity, mostly because almost no PAD dataset carries demographic labels.
+    CelebA-Spoof does, which is the only reason this function can exist.
+
+    Reads only `attr:`-prefixed keys, which `celeba_spoof.parse_label` writes for
+    attributes of the PERSON. Capture conditions (illumination, screen type) are
+    deliberately excluded: a disparity by screen bezel is not a fairness finding.
+
+    Returns per-attribute groups with BPCER, plus the worst/best ratio and whether
+    it clears the four-fifths screening threshold. Groups under
+    MIN_FAIRNESS_GROUP report their count and no rate, because a bias claim from a
+    handful of samples is worse than no claim.
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    if not (len(scores) == len(attack_types) == len(conditions)):
+        raise ValueError(
+            f"misaligned inputs: {len(scores)} scores, {len(attack_types)} types, "
+            f"{len(conditions)} condition dicts"
+        )
+
+    # attribute -> group value -> [n_bona_fide, n_rejected]
+    groups: dict[str, dict[str, list[int]]] = {}
+    for score, attack_type, cond in zip(scores, attack_types, conditions, strict=True):
+        # Bona fide only. An attack sample has no bearing on whether a real person
+        # is being locked out, and mixing them would make this a confused blend of
+        # two different rates.
+        if attack_type.is_attack or not cond:
+            continue
+        for key, value in cond.items():
+            if not key.startswith("attr:"):
+                continue
+            slot = groups.setdefault(key[5:], {}).setdefault(str(value), [0, 0])
+            slot[0] += 1
+            slot[1] += int(score >= threshold)  # scored as attack == wrongly rejected
+
+    out: dict[str, dict] = {}
+    for attribute, values in sorted(groups.items()):
+        rates: dict[str, dict] = {}
+        for value, (n, rejected) in sorted(values.items()):
+            rate = (rejected / n) if n >= MIN_FAIRNESS_GROUP else None
+            rates[value] = {"n": n, "rejected": rejected, "bpcer": rate}
+
+        # A ratio needs at least two groups that both cleared the size floor;
+        # otherwise there is nothing to compare and reporting a ratio would
+        # manufacture a comparison out of one number.
+        usable = [v["bpcer"] for v in rates.values() if v["bpcer"] is not None]
+        entry: dict = {"groups": rates}
+        if len(usable) >= 2:
+            worst, best = max(usable), min(usable)
+            # A zero best-rate makes the ratio infinite, which is technically true
+            # and useless to print. The absolute gap stays meaningful either way,
+            # so it is reported alongside rather than instead.
+            entry["ratio"] = (worst / best) if best > 0 else None
+            entry["gap"] = worst - best
+            entry["flagged"] = (
+                entry["ratio"] is not None and entry["ratio"] >= DISPARATE_IMPACT_RATIO
+            ) or (best == 0 and worst > 0)
+        out[attribute] = entry
     return out
 
 
@@ -116,6 +214,9 @@ def evaluate_test(
         strata = stratify(scores, attack_types, conditions, val_threshold)
         if strata:
             result["by_condition"] = strata
+        fairness = fairness_audit(scores, attack_types, conditions, val_threshold)
+        if fairness:
+            result["fairness"] = fairness
     return result
 
 
@@ -177,6 +278,41 @@ def render_report(result: dict, title: str = "PAD Evaluation") -> str:
                 else:
                     add(f"      {value:12s} {e['apcer'] * 100:6.2f}%   (n={e['n']})")
         add("")
+
+    fairness = result.get("fairness")
+    if fairness:
+        add("  BPCER by demographic group")
+        add("  (who gets wrongly rejected — the aggregate BPCER above is an average")
+        add("   over groups that may not experience this model the same way)")
+        # Flagged attributes first: the point of the table is the disparity.
+        ranked = sorted(
+            fairness.items(),
+            key=lambda kv: (not kv[1].get("flagged"), -(kv[1].get("ratio") or 0.0)),
+        )
+        for attribute, entry in ranked:
+            groups = entry["groups"]
+            note = ""
+            if entry.get("flagged"):
+                r = entry.get("ratio")
+                note = f"   <-- {r:.2f}x disparity" if r else "   <-- one group at 0%"
+            add(f"    {attribute}{note}")
+            for value, g in sorted(groups.items(), key=lambda kv: -(kv[1]["bpcer"] or -1.0)):
+                if g["bpcer"] is None:
+                    add(f"      {value:6s}      n/a    (n={g['n']}, too few to rate)")
+                else:
+                    add(f"      {value:6s} {g['bpcer'] * 100:6.2f}%   (n={g['n']})")
+        add("")
+        if any(e.get("flagged") for e in fairness.values()):
+            add(f"  Flagged where the worst group's BPCER is >= {DISPARATE_IMPACT_RATIO:.2f}x the")
+            add("  best group's — the four-fifths rule used for disparate-impact")
+            add("  screening. A flag is a prompt to investigate, not a finding.")
+            add("")
+        if "Pale_Skin" in fairness:
+            add("  CAVEAT: Pale_Skin is a binary crowd-sourced annotation, not a")
+            add("  validated skin-tone measurement (not Fitzpatrick, not Monk). A")
+            add("  disparity along it is a signal worth investigating, NOT a measured")
+            add("  skin-tone bias, and should not be reported as one.")
+            add("")
 
     if result.get("bpcer_at_apcer"):
         add("  Usability cost of a fixed security target")
