@@ -23,8 +23,8 @@ recognized *and* verified live.
                   └───────┘
 ```
 
-Runs fully offline. No cloud, no API keys, no telemetry. `pip install trainyourface`
-with no compiler.
+Runs fully offline. No cloud, no API keys, no telemetry. Installs with no compiler —
+no CMake, no C++ toolchain, no dlib.
 
 ---
 
@@ -67,12 +67,20 @@ metric unverifiable — not just by a reader, but by me.
 
 ## Install
 
+Not on PyPI yet — install from the repo:
+
 ```bash
-pip install trainyourface          # inference: detect, enroll, recognize, liveness
-pip install 'trainyourface[demo]'  # + the live webcam window
-pip install 'trainyourface[train]' # + PyTorch, to train your own liveness model
-pip install 'trainyourface[export]'# + ONNX/CoreML export and quantization
+TYF="git+https://github.com/kcitlyn/TrainYourFace"
+
+pip install "$TYF"                 # inference: detect, enroll, recognize, liveness
+pip install "trainyourface[demo] @ $TYF"   # + the live webcam window
+pip install "trainyourface[train] @ $TYF"  # + PyTorch, to train your own model
+pip install "trainyourface[export] @ $TYF" # + ONNX/CoreML export and quantization
 ```
+
+Every one of those resolves without a compiler, which is the claim CI exists to check:
+the matrix builds on Linux/macOS/Windows × Python 3.10/3.13 and would fail outright on
+a dlib-based project.
 
 Model weights download on first use and are cached. Nothing to place by hand.
 
