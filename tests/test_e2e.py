@@ -651,3 +651,83 @@ class TestGatedPipeline:
         face = pipeline.process(_bona_fide(rng)).faces[0]
         assert face.liveness is None
         assert not face.is_trustworthy, "no liveness check must never read as trustworthy"
+
+
+class TestPublicAPIAgainstARealModel:
+    """The `LivenessDetector` facade, exercised against the artifact just trained.
+
+    These paths cannot be covered by the stubbed API tests: they need a real ONNX
+    session, because what they verify is that the facade reads the checkpoint's
+    threshold and its verdicts agree with the underlying model. A stub would just
+    be asserting the stub.
+    """
+
+    def test_it_loads_the_exported_model_and_its_threshold(self, exported, trained):
+        """The threshold must come from training, not from a library default.
+
+        `FALLBACK_THRESHOLD` exists for a model with no recorded threshold. If the
+        facade silently used it for a model that HAS one, every verdict would be
+        taken at an operating point nobody chose, and the reported metrics would
+        describe a different classifier than the one running.
+        """
+        from trainyourface import LivenessDetector
+
+        out, _ = trained
+        det = LivenessDetector(model_path=exported[0])
+        summary = json.loads((out / "train_summary.json").read_text())
+        assert det.threshold == pytest.approx(summary["val_threshold"], abs=1e-6)
+
+    def test_a_crop_is_scored_without_detection(self, exported):
+        """detect=False is the "I already have a face" path."""
+        from trainyourface import LivenessDetector
+
+        det = LivenessDetector(model_path=exported[0])
+        rng = np.random.default_rng(11)
+        result = det.check(_bona_fide(rng), detect=False)
+        assert result is not None
+        assert 0.0 <= result.spoof_probability <= 1.0
+        assert result.threshold == pytest.approx(det.threshold)
+
+    def test_the_facade_agrees_with_the_underlying_model(self, exported):
+        """The facade must not transform the score it reports.
+
+        A rounding or re-normalization here would make the library disagree with
+        `tyf eval` on the same image, which is the train/serve mismatch class of
+        bug this project already fixed once.
+        """
+        from trainyourface import LivenessDetector
+
+        det = LivenessDetector(model_path=exported[0])
+        rng = np.random.default_rng(12)
+        crop = _attack(rng)
+        via_facade = det.check(crop, detect=False).spoof_probability
+        via_model = float(det.model.spoof_probability([crop])[0])
+        assert via_facade == pytest.approx(via_model, abs=1e-6)
+
+    def test_it_ranks_attacks_above_bona_fide(self, exported):
+        """Asserted as ranking, not as an absolute margin — see the note in
+        TestPredictStage on why a margin assertion tests calibration instead."""
+        from trainyourface import LivenessDetector
+
+        det = LivenessDetector(model_path=exported[0])
+        rng = np.random.default_rng(13)
+        live = np.array(
+            [det.check(_bona_fide(rng), detect=False).spoof_probability for _ in range(6)]
+        )
+        spoof = np.array(
+            [det.check(_attack(rng), detect=False).spoof_probability for _ in range(6)]
+        )
+        assert spoof.min() > live.max(), f"live={live.round(4)} spoof={spoof.round(4)}"
+
+    def test_an_empty_frame_yields_no_verdict_rather_than_a_guess(self, exported):
+        """With detection on and no face present, None is the honest answer.
+
+        Returning a LivenessResult for a face that isn't there would be a
+        fabricated verdict, and a caller checking `.is_live` on it would be
+        reading a number about nothing.
+        """
+        from trainyourface import LivenessDetector
+
+        det = LivenessDetector(model_path=exported[0])
+        assert det.check(np.zeros((240, 320, 3), np.uint8)) is None
+        assert det.check_all(np.zeros((240, 320, 3), np.uint8)) == []

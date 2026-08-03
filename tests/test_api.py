@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from trainyourface.core.contracts import AttackType
+from trainyourface.core.embed import EMBEDDING_DIM
 from trainyourface.eval.report import (
     DISPARATE_IMPACT_RATIO,
     MIN_FAIRNESS_GROUP,
@@ -314,6 +315,183 @@ class TestFairnessRendering:
         assert not any(k.startswith("attr:") or k == "Male" for k in out)
 
 
+def _observation(name=None, is_live=None, embedding=True, box=(0, 0, 40, 40)):
+    """A FaceObservation as the real pipeline would emit one."""
+    from trainyourface.core.contracts import Box, FaceObservation, Identity, LivenessResult
+
+    liveness = None
+    if is_live is not None:
+        # spoof_probability below threshold == live, matching LivenessResult.is_live
+        liveness = LivenessResult(
+            spoof_probability=0.1 if is_live else 0.9,
+            threshold=0.5,
+        )
+    return FaceObservation(
+        box=Box(x1=box[0], y1=box[1], x2=box[2], y2=box[3], score=0.99),
+        embedding=(np.ones(EMBEDDING_DIM, np.float32) if embedding else None),
+        identity=(Identity(name=name, similarity=0.9) if name else None),
+        liveness=liveness,
+    )
+
+
+class _StubPipeline:
+    """Stands in for FacePipeline, counting how many times it runs.
+
+    The count is the point for one of these tests: `enroll` used to call the
+    pipeline twice, which made the liveness verdict it enforced belong to a
+    different inference than the embedding it stored.
+    """
+
+    def __init__(self, observations):
+        self._observations = observations
+        self.calls = 0
+
+    def process(self, frame):
+        self.calls += 1
+        from trainyourface.core.pipeline import FrameResult
+
+        return FrameResult(faces=list(self._observations))
+
+
+@pytest.fixture
+def stub_faceid(tmp_path, monkeypatch):
+    """A FaceID whose pipeline is a stub, so no weights or camera are needed.
+
+    Builds the real object with require_liveness=False (no model on a CI box) and
+    then swaps the pipeline, so the store, the TrustedFace projection, and the
+    enroll guards are all the genuine code paths.
+    """
+
+    def _make(observations, require_liveness=True):
+        # Point the model lookup at a path that doesn't exist so FaceID takes its
+        # no-model branch. Patching the LivenessDetector CLASS instead breaks
+        # `isinstance(liveness, LivenessDetector)` inside __init__ — a stub that
+        # sabotages the code it is meant to exercise, which is how the first
+        # version of this fixture failed 14 tests for the wrong reason.
+        import trainyourface.core.detect as detect_mod
+        import trainyourface.core.embed as embed_mod
+        import trainyourface.liveness.predict as predict
+
+        monkeypatch.setattr(predict, "default_model_path", lambda: tmp_path / "absent.onnx")
+        # Detector and embedder are constructed eagerly and would fetch weights.
+        # The pipeline is replaced right after, so they are never used.
+        monkeypatch.setattr(detect_mod, "FaceDetector", lambda *a, **k: object())
+        monkeypatch.setattr(embed_mod, "FaceEmbedder", lambda *a, **k: object())
+
+        from trainyourface.api import FaceID
+
+        fid = FaceID(store_path=tmp_path / "store.npz", require_liveness=False)
+        fid.pipeline = _StubPipeline(observations)
+        fid.require_liveness = require_liveness
+        return fid
+
+    return _make
+
+
+class TestFaceIDBehaviour:
+    """The methods that were at 0% coverage: identify, enroll, forget, names."""
+
+    def test_identify_projects_every_face(self, stub_faceid):
+        fid = stub_faceid([_observation(name="kc", is_live=True), _observation(is_live=False)])
+        faces = fid.identify(np.zeros((40, 40, 3), np.uint8))
+        assert [f.status for f in faces] == ["TRUSTED", "SPOOF"]
+        assert faces[0].box == (0, 0, 40, 40)
+
+    def test_identify_on_an_empty_frame_returns_nothing(self, stub_faceid):
+        fid = stub_faceid([])
+        assert fid.identify(np.zeros((40, 40, 3), np.uint8)) == []
+
+    def test_enroll_runs_the_pipeline_exactly_once(self, stub_faceid):
+        """The bug this pins is a security bug, not a performance one.
+
+        `enroll` used to call `identify()` for the liveness check and then
+        `pipeline.process()` again for the embedding — a second, independent
+        inference. The verdict that gated enrollment was therefore not the verdict
+        belonging to the embedding actually stored, so a borderline face could
+        pass the gate on run one and be saved on run two regardless.
+        """
+        fid = stub_faceid([_observation(is_live=True)])
+        fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+        assert fid.pipeline.calls == 1, "the check must bind to the stored artifact"
+
+    def test_enroll_stores_the_embedding(self, stub_faceid):
+        fid = stub_faceid([_observation(is_live=True)])
+        face = fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+        assert face.is_live is True
+        assert fid.names == ["kc"]
+
+    def test_enroll_refuses_a_spoof(self, stub_faceid):
+        """The core security property at the enrollment boundary.
+
+        A photo enrolled as a person makes that photo a permanent credential.
+        """
+        fid = stub_faceid([_observation(is_live=False, embedding=False)])
+        with pytest.raises(ValueError, match="refusing to enroll"):
+            fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+        assert fid.names == [], "nothing may be stored when the check fails"
+
+    def test_enroll_refuses_unverified_liveness(self, stub_faceid):
+        """Fails closed: unknown liveness is not permission to enroll."""
+        fid = stub_faceid([_observation(is_live=None)])
+        with pytest.raises(ValueError, match="UNVERIFIED"):
+            fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+
+    def test_enroll_refuses_multiple_faces(self, stub_faceid):
+        fid = stub_faceid([_observation(is_live=True), _observation(is_live=True)])
+        with pytest.raises(ValueError, match="2 faces detected"):
+            fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+
+    def test_enroll_refuses_an_empty_frame(self, stub_faceid):
+        fid = stub_faceid([])
+        with pytest.raises(ValueError, match="no face detected"):
+            fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+
+    def test_enroll_explains_a_missing_embedding(self, stub_faceid):
+        """With require_liveness=False a spoof passes the gate but is never
+        embedded, because the pipeline refuses to recognize it. The error has to
+        say that rather than blaming the frame."""
+        fid = stub_faceid([_observation(is_live=False, embedding=False)], require_liveness=False)
+        with pytest.raises(ValueError, match="nothing to enroll"):
+            fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+
+    def test_enroll_rejects_an_empty_name(self, stub_faceid):
+        """Guarded by the store, which is the right layer — asserted here so the
+        API can't later start accepting one."""
+        fid = stub_faceid([_observation(is_live=True)])
+        with pytest.raises(ValueError, match="cannot be empty"):
+            fid.enroll("   ", np.zeros((40, 40, 3), np.uint8))
+
+    def test_names_is_readable_and_not_a_bound_method(self, stub_faceid):
+        """`store.identities` is a property, not a method.
+
+        Calling it raised TypeError: 'list' object is not callable — and that
+        shipped, because no test ever read this attribute.
+        """
+        fid = stub_faceid([_observation(is_live=True)])
+        assert fid.names == []
+        fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+        assert fid.names == ["kc"]
+
+    def test_forget_removes_and_persists(self, stub_faceid):
+        fid = stub_faceid([_observation(is_live=True)])
+        fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+        assert fid.forget("kc") == 1
+        assert fid.names == []
+
+    def test_forget_an_unknown_name_is_zero_not_an_error(self, stub_faceid):
+        fid = stub_faceid([])
+        assert fid.forget("ghost") == 0
+
+    def test_enrollment_survives_a_reload(self, stub_faceid, tmp_path):
+        """Durability: enroll() saves, so a new store on the same path sees it."""
+        fid = stub_faceid([_observation(is_live=True)])
+        fid.enroll("kc", np.zeros((40, 40, 3), np.uint8))
+
+        from trainyourface.core.store import EnrollmentStore
+
+        assert EnrollmentStore(tmp_path / "store.npz").identities == ["kc"]
+
+
 class TestPublicAPISurface:
     def test_importing_the_package_is_cheap(self):
         """Lazy exports keep ONNX Runtime out of a process that wanted a version."""
@@ -321,6 +499,25 @@ class TestPublicAPISurface:
 
         assert trainyourface.__version__
         assert "LivenessDetector" in trainyourface.__all__
+
+    def test_the_version_matches_pyproject(self):
+        """Two hand-maintained copies drift.
+
+        release.yml only checks the git tag against pyproject.toml, so a bump that
+        missed __init__.py would publish a wheel whose `pip show` version and
+        `__version__` disagree — permanently, since a PyPI version can never be
+        re-uploaded. __version__ now reads installed metadata, and this asserts
+        the two agree.
+        """
+        from pathlib import Path
+
+        import tomllib
+
+        import trainyourface
+
+        root = Path(__file__).resolve().parent.parent
+        declared = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+        assert trainyourface.__version__ == declared
 
     def test_the_three_public_names_resolve(self):
         from trainyourface import FaceID, LivenessDetector, TrustedFace
