@@ -126,8 +126,15 @@ def train(
     out_dir: Path | str,
     config: TrainConfig | None = None,
     log=print,
+    split: dict | None = None,
 ) -> dict:
-    """Train the PAD model. Returns a summary dict; writes checkpoints to out_dir."""
+    """Train the PAD model. Returns a summary dict; writes checkpoints to out_dir.
+
+    Args:
+        split: optional `split_fingerprint()` output, persisted into
+            train_summary.json so a later `tyf eval` can prove it reconstructed
+            the same held-out partition rather than assuming it did.
+    """
     import torch
     import torch.nn as nn
 
@@ -263,6 +270,7 @@ def train(
         "best_epoch": best_epoch,
         "best_val_eer": best_eer,
         "val_threshold": val_threshold,
+        "split": split,
         "val_report": val_report.model_dump(),
         "history": [asdict(h) for h in history],
         "config": {**asdict(cfg), "model": asdict(cfg.model)},

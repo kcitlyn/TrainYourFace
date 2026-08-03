@@ -134,6 +134,14 @@ Every one of these is a way to get a better-looking number that means less:
 - **Pick the threshold on test.** Extremely common and easy to do by accident. The
   deployment threshold is chosen on **validation** and applied unchanged to test. Both
   numbers get printed, because the gap between them is itself informative.
+- **Trust that "held out" means held out.** `tyf eval` doesn't read a stored split — it
+  re-derives one from the manifest using `--seed` and `--split-by`, which default to
+  `0`/`subject` no matter what training used. Evaluate a model trained with `--seed 7`
+  and you get a *different* partition, with subjects the model trained on sitting in the
+  "held-out" test set. Nothing looks wrong: the new split is still internally disjoint,
+  so the integrity check passes and the report renders normally with inflated numbers.
+  Training now records **which subjects** were held out, and `eval` verifies its
+  reconstruction against that list before scoring anything.
 - **Select checkpoints on accuracy.** On an attack-heavy set, accuracy rewards a model
   that leans toward predicting "attack" — which looks fine and locks real users out.
   Selection is on validation **EER**, which is threshold-free.
@@ -162,16 +170,49 @@ iterations, 30 warmup excluded. Reproduce with `tyf bench --full-pipeline`.
 Liveness costs ~2% of the frame budget. Detection dominates, which is the useful thing
 to know before optimizing anything.
 
-**Accuracy** — not yet measured on real data. The pipeline is verified end to end on a
-synthetic fixture, but that fixture is trivially separable and reports 0.00% on
-everything, so publishing it as a result would be meaningless. Real capture is the next
-step; `tyf eval --markdown` writes the table straight into this section so the numbers
-can't drift from the model that produced them.
+**Accuracy** — not yet measured on real data, and deliberately not quoted here. The
+pipeline is verified end to end on a synthetic fixture (smooth gradients as "bona fide",
+a high-frequency grid standing in for moiré), which is enough to prove the plumbing:
+gradients flow, the validation threshold survives export, and the ONNX model agrees with
+PyTorch to 1e-4. It is *not* an accuracy result — the cue is one the model finds in six
+epochs, and quoting a rate off it would be exactly the kind of flattering number the rest
+of this README is about avoiding. Real capture is the next step; `tyf eval --markdown`
+writes the table straight into this section so the numbers can't drift from the model
+that produced them.
 
 Metrics reported, per ISO/IEC 30107-3: **APCER** per attack type (attack frames wrongly
 accepted), **BPCER** (real users wrongly rejected), **ACER**, **EER**, and
 BPCER @ APCER ≤ 1%/5%/10% — because the operating point you'd actually deploy at is
 the one worth quoting.
+
+---
+
+## Tests
+
+```bash
+pytest                        # 304 tests
+pytest -m train               # + the end-to-end run (trains a real model, ~3 min)
+pytest --cov=trainyourface    # 71% total
+```
+
+The suite is organized around the failure modes rather than around the modules, because
+the bugs in this project were never "this function returns the wrong number" — they were
+"this number is real but it means something other than what the label says."
+
+- **`test_e2e.py`** runs the whole chain for real: capture fixture → `train` → `eval` →
+  `export` → load the ONNX artifact → gate recognition through it. It asserts the
+  properties that a per-module test can't see, chiefly that the threshold in the test
+  report is the *validation* threshold, byte-identical, and that ONNX and PyTorch agree
+  to 1e-4 on the exported model.
+- **`test_robustness.py`** is the adversarial half — degenerate splits, single-class
+  datasets, corrupt summaries, NaNs, and the split-reconstruction leak above.
+- **`test_cli.py`** drives every command through `CliRunner` and asserts **exit codes**,
+  not just messages. A CI pipeline checks `$?`, not prose, so a guard that prints an
+  error and exits 0 is not a guard.
+
+Two things the tests deliberately don't claim: `cli/live.py` and `cli/capture.py` sit at
+0% because they need a physical camera, and the e2e liveness numbers are plumbing
+verification on synthetic data, not accuracy. Both are stated rather than papered over.
 
 ---
 

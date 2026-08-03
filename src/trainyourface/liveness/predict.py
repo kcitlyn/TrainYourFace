@@ -69,6 +69,24 @@ def load_threshold(run_dir: Path | str) -> float | None:
     return float(value) if value is not None else None
 
 
+def load_split(run_dir: Path | str) -> dict | None:
+    """Read the recorded train/val/test group split from a training run directory.
+
+    Returns None when absent — checkpoints trained before this was recorded, or a
+    run directory that was moved without its summary. Callers treat that as
+    "cannot verify" rather than "verified", since the two are very different
+    claims to make about a held-out test set.
+    """
+    summary = Path(run_dir) / "train_summary.json"
+    if not summary.exists():
+        return None
+    try:
+        split = json.loads(summary.read_text()).get("split")
+    except (json.JSONDecodeError, OSError):
+        return None
+    return split if isinstance(split, dict) and split.get("test") else None
+
+
 class LivenessModel:
     """Runs PAD inference on face crops.
 

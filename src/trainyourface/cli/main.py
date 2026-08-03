@@ -256,6 +256,7 @@ def train(
     from trainyourface.liveness.dataset import (
         DatasetManifest,
         check_split_integrity,
+        split_fingerprint,
         subject_disjoint_split,
     )
     from trainyourface.liveness.model import ModelConfig
@@ -293,7 +294,16 @@ def train(
         device=device,
         model=ModelConfig(width=width),
     )
-    summary = run_train(train_s, val_s, root=data, out_dir=out, config=cfg)
+    summary = run_train(
+        train_s,
+        val_s,
+        root=data,
+        out_dir=out,
+        config=cfg,
+        # Recorded so `tyf eval` can verify it re-derived the same partition
+        # instead of trusting that whoever ran it passed the same flags.
+        split=split_fingerprint(train_s, val_s, test_s, by=split_by),
+    )
 
     # Test runs once, at the val-selected threshold. Iterating on this number is
     # how a test split stops being held out.
@@ -336,8 +346,9 @@ def eval_cmd(
         DatasetManifest,
         check_split_integrity,
         subject_disjoint_split,
+        verify_split_matches,
     )
-    from trainyourface.liveness.predict import load_threshold
+    from trainyourface.liveness.predict import load_split, load_threshold
 
     if not checkpoint.exists():
         typer.secho(f"no checkpoint at {checkpoint}", fg=typer.colors.RED)
@@ -352,9 +363,49 @@ def eval_cmd(
         )
         raise typer.Exit(code=1)
 
-    m = DatasetManifest.load(data / "manifest.json")
-    train_s, val_s, test_s = subject_disjoint_split(m.samples, seed=seed, by=split_by)
-    check_split_integrity(train_s, val_s, test_s, by=split_by)
+    # The same guards as `train`. `eval` is the command run against someone
+    # else's checkpoint or a moved dataset, so it is the one most likely to be
+    # pointed at a missing manifest — and a raw FileNotFoundError traceback names
+    # a path without saying which flag to change.
+    manifest_path = data / "manifest.json"
+    if not manifest_path.exists():
+        typer.secho(
+            f"no manifest at {manifest_path}. Pass --data pointing at the dataset "
+            "the checkpoint was trained on.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    m = DatasetManifest.load(manifest_path)
+    try:
+        train_s, val_s, test_s = subject_disjoint_split(m.samples, seed=seed, by=split_by)
+        check_split_integrity(train_s, val_s, test_s, by=split_by)
+    except ValueError as exc:
+        typer.secho(f"split failed: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(code=1) from exc
+
+    # `--seed` and `--split-by` default to 0/"subject" no matter what training
+    # used, so a mismatch silently re-partitions the data and puts trained-on
+    # subjects into the "held-out" test set. The result still looks correct —
+    # internally disjoint, normal-looking report — so it is checked, not assumed.
+    fingerprint = load_split(checkpoint.parent)
+    if fingerprint:
+        try:
+            verify_split_matches(fingerprint, test_s, by=split_by)
+        except ValueError as exc:
+            typer.secho(f"\nSPLIT MISMATCH: {exc}", fg=typer.colors.RED)
+            raise typer.Exit(code=1) from exc
+        typer.secho(
+            f"test split matches training ({len(fingerprint['test'])} held-out "
+            f"{fingerprint['by']}s, verified)",
+            fg=typer.colors.CYAN,
+        )
+    else:
+        typer.secho(
+            "no split recorded beside this checkpoint; cannot verify the test set "
+            "is the one held out during training.",
+            fg=typer.colors.YELLOW,
+        )
 
     result = evaluate_checkpoint(checkpoint, test_s, root=data, threshold=thr)
     if markdown:
