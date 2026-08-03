@@ -2,9 +2,36 @@
 venv/
 .venv/
 env/
-.env/
 ENV/
 
-# holds sensistive user info regarding face descriptors / personal relations
-face_descriptors.json
-face_properties.json
+# Python build/cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Downloaded model weights (fetched on first run, never committed)
+models/
+*.onnx
+*.mlpackage/
+*.engine
+*.dat
+
+# Training outputs
+runs/
+checkpoints/
+*.pt
+*.pth
+
+# Enrolled face data — PII. Never commit.
+face_data/
+enrollments/
+*.npz
+
+# Datasets
+data/
