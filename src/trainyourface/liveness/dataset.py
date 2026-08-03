@@ -164,6 +164,18 @@ def subject_disjoint_split(
         raise ValueError(f"`by` must be 'subject' or 'session', got {by!r}")
     if not samples:
         raise ValueError("cannot split an empty sample list")
+    # Fractions are validated because the failure is silent, not loud: passing 20
+    # meaning "20%" clamps to one val group and one test group and still returns a
+    # plausible-looking split, so the reported metrics would come from a test set
+    # of one subject without anything saying so.
+    for label, frac in (("val_fraction", val_fraction), ("test_fraction", test_fraction)):
+        if not 0.0 <= frac < 1.0:
+            raise ValueError(f"{label} must be in [0, 1), got {frac}")
+    if val_fraction + test_fraction >= 1.0:
+        raise ValueError(
+            f"val_fraction + test_fraction must leave room for training, got "
+            f"{val_fraction} + {test_fraction} = {val_fraction + test_fraction}"
+        )
 
     key = (lambda s: s.subject) if by == "subject" else (lambda s: f"{s.subject}/{s.session}")
 
@@ -185,8 +197,18 @@ def subject_disjoint_split(
     n = len(names)
     n_test = max(1, int(round(n * test_fraction)))
     n_val = max(1, int(round(n * val_fraction)))
-    # Guarantee at least one group left for training.
+    # Guarantee at least one group left for training. Falling back to one group
+    # each is a real change to what was asked for — with 10 subjects and
+    # val_fraction=0.9 it turns 9 val groups into 1 — so it is announced rather
+    # than applied silently. A test set that quietly shrank to a single subject
+    # still produces confident-looking metrics.
     if n_test + n_val >= n:
+        print(
+            f"warning: val_fraction={val_fraction} + test_fraction={test_fraction} "
+            f"would leave no training {by}s ({n_val} val + {n_test} test of {n} "
+            f"{by}s). Using 1 val and 1 test {by} instead; metrics from a "
+            f"single-{by} split are indicative at best."
+        )
         n_test, n_val = 1, 1
 
     test_names = set(names[:n_test])
@@ -198,6 +220,67 @@ def subject_disjoint_split(
         target.extend(groups[name])
 
     return train, val, test
+
+
+def split_fingerprint(
+    train: list[Sample], val: list[Sample], test: list[Sample], by: str = "subject"
+) -> dict:
+    """Record exactly which groups landed in which split.
+
+    Written next to a checkpoint at train time so `tyf eval` can prove it is
+    scoring the same held-out data, rather than assuming it. See
+    `verify_split_matches` for why assuming is not good enough.
+    """
+    key = (lambda s: s.subject) if by == "subject" else (lambda s: f"{s.subject}/{s.session}")
+    return {
+        "by": by,
+        "train": sorted({key(s) for s in train}),
+        "val": sorted({key(s) for s in val}),
+        "test": sorted({key(s) for s in test}),
+    }
+
+
+def verify_split_matches(fingerprint: dict, test: list[Sample], by: str = "subject") -> None:
+    """Check a freshly reconstructed test split against the one used at train time.
+
+    This closes a leak that no other check catches. `tyf eval` does not read a
+    stored split — it re-derives one from the manifest using `--seed` and
+    `--split-by`. Those default to 0 and "subject" regardless of what training
+    actually used, so evaluating a model trained with `--seed 7` produces a
+    *different* partition, and subjects the model trained on land in the
+    "held-out" test set. Every reported number then flatters the model, and
+    nothing about the output looks wrong: the split is still internally disjoint,
+    so `check_split_integrity` passes and the report reads normally.
+
+    Comparing against the recorded groups is what makes "held-out" verifiable
+    rather than a claim about how the command was invoked.
+    """
+    key = (lambda s: s.subject) if by == "subject" else (lambda s: f"{s.subject}/{s.session}")
+    got = sorted({key(s) for s in test})
+    expected = sorted(fingerprint.get("test", []))
+    if not expected:
+        return
+
+    if fingerprint.get("by") != by:
+        raise ValueError(
+            f"this model was trained with --split-by {fingerprint.get('by')!r} but you "
+            f"passed {by!r}. The reconstructed split differs from the trained one."
+        )
+    if got != expected:
+        leaked = sorted(set(got) & set(fingerprint.get("train", [])))
+        detail = (
+            f" {len(leaked)} of them were TRAINED on: {leaked[:5]}"
+            if leaked
+            else " no trained groups leaked in, but the partition still differs"
+        )
+        raise ValueError(
+            f"the reconstructed test split does not match the one used for training.\n"
+            f"  trained on test {by}s: {expected}\n"
+            f"  reconstructed:        {got}\n"
+            f"{detail}.\n"
+            "Pass the --seed and --split-by that training used; the values are in "
+            "train_summary.json under 'split'."
+        )
 
 
 def check_split_integrity(
@@ -248,7 +331,18 @@ def to_model_input(img: np.ndarray) -> np.ndarray:
 
     A train/serve preprocessing mismatch is invisible in tests that only exercise
     one side, so both sides call this one function.
+
+    The shape is checked because the wrong one doesn't raise on its own: a 4-channel
+    BGRA frame (what some capture backends and PNG reads produce) passes straight
+    through the reverse-and-transpose and yields a (4, H, W) tensor, which then
+    fails deep inside the model with a shape error that names neither this function
+    nor the image that caused it.
     """
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError(
+            f"expected an (H, W, 3) BGR uint8 image, got shape {img.shape}. A 4-channel "
+            "(BGRA) or single-channel image must be converted before this point."
+        )
     rgb = img[:, :, ::-1].astype(np.float32)
     rgb = (rgb - 127.5) / 127.5
     return np.ascontiguousarray(rgb.transpose(2, 0, 1))
