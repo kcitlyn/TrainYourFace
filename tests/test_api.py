@@ -508,16 +508,23 @@ class TestPublicAPISurface:
         `__version__` disagree — permanently, since a PyPI version can never be
         re-uploaded. __version__ now reads installed metadata, and this asserts
         the two agree.
-        """
-        from pathlib import Path
 
-        import tomllib
+        Read with a regex rather than `tomllib`, which is stdlib only from 3.11
+        while this project supports 3.10. The first version of this test imported
+        tomllib and broke all three 3.10 CI jobs — a test asserting a packaging
+        invariant has no business being the thing that fails on a supported
+        interpreter.
+        """
+        import re
+        from pathlib import Path
 
         import trainyourface
 
         root = Path(__file__).resolve().parent.parent
-        declared = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
-        assert trainyourface.__version__ == declared
+        pyproject = (root / "pyproject.toml").read_text()
+        match = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
+        assert match, "no version line in pyproject.toml"
+        assert trainyourface.__version__ == match.group(1)
 
     def test_the_three_public_names_resolve(self):
         from trainyourface import FaceID, LivenessDetector, TrustedFace
