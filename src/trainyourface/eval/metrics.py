@@ -148,12 +148,11 @@ def apcer_bpcer(
     types_arr = np.array([t.value for t in types])
     bona_mask = types_arr == AttackType.BONA_FIDE.value
 
-    # BPCER: genuine samples wrongly flagged as attacks.
+    # BPCER: genuine samples wrongly flagged as attacks. With no genuine samples
+    # the rate is undefined; 0.0 is the neutral value and `evaluate` refuses a
+    # split missing either class, so this can't silently become a reported "0%".
     n_bona = int(bona_mask.sum())
-    if n_bona:
-        bpcer = float((scores_arr[bona_mask] >= threshold).mean())
-    else:
-        bpcer = 0.0
+    bpcer = float((scores_arr[bona_mask] >= threshold).mean()) if n_bona else 0.0
 
     # APCER per type: attacks wrongly accepted as genuine.
     apcer_by_type: dict[str, float] = {}
