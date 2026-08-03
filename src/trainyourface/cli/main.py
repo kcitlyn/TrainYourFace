@@ -205,7 +205,8 @@ def manifest(
     typer.echo(f"\n{m.describe()}\n")
 
     if check:
-        missing = [s.path for s in m.samples if not (data / s.path).exists()]
+        image_root = m.image_root(data)
+        missing = [s.path for s in m.samples if not (image_root / s.path).exists()]
         if missing:
             typer.secho(f"{len(missing)} listed images are missing:", fg=typer.colors.RED)
             for p in missing[:5]:
@@ -224,6 +225,44 @@ def manifest(
     except ValueError as exc:
         typer.secho(f"\nnot splittable yet: {exc}", fg=typer.colors.YELLOW)
         raise typer.Exit(code=1) from exc
+
+
+@app.command(name="import-celeba")
+def import_celeba(
+    root: Path = typer.Argument(..., help="CelebA-Spoof directory (the one containing Data/)."),
+    out: Path = typer.Option(DEFAULT_DATA_DIR, help="Where to write manifest.json."),
+    label_file: Path = typer.Option(None, help="Annotation JSON. Default: metas/intra_test/."),
+    limit: int = typer.Option(
+        None, help="Cap the sample count. Samples whole subjects, not random images."
+    ),
+) -> None:
+    """Convert a downloaded CelebA-Spoof dataset into a manifest.
+
+    625K images, 10,177 subjects, direct download with no license application —
+    the only public PAD dataset that doesn't need a signed institutional
+    agreement. Non-commercial research use only, per the dataset's terms; nothing
+    from it is redistributed here.
+    """
+    from trainyourface.liveness.celeba_spoof import convert
+
+    try:
+        m = convert(root, label_file=label_file, limit=limit, log=typer.echo)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"import failed: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(code=1) from exc
+
+    # Point the manifest's root at the CelebA tree so images resolve from wherever
+    # the manifest lands. Copying 625K images to sit beside it is not an option.
+    out.mkdir(parents=True, exist_ok=True)
+    m.root = str(Path(root).resolve())
+    m.save(out / "manifest.json")
+
+    typer.echo(f"\n{m.describe()}\n")
+    typer.secho(f"wrote {out / 'manifest.json'}", fg=typer.colors.GREEN)
+    typer.echo(
+        "\nCite: Zhang et al., CelebA-Spoof: Large-Scale Face Anti-Spoofing "
+        "Dataset with Rich Annotations, ECCV 2020."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -294,10 +333,13 @@ def train(
         device=device,
         model=ModelConfig(width=width),
     )
+    # The manifest knows where its images live; --data is only the fallback. An
+    # imported manifest points at the source dataset tree.
+    image_root = m.image_root(data)
     summary = run_train(
         train_s,
         val_s,
-        root=data,
+        root=image_root,
         out_dir=out,
         config=cfg,
         # Recorded so `tyf eval` can verify it re-derived the same partition
@@ -311,7 +353,7 @@ def train(
     result = evaluate_checkpoint(
         out / "best.pt",
         test_s,
-        root=data,
+        root=image_root,
         threshold=summary["val_threshold"],
         device=device,
     )
@@ -330,14 +372,24 @@ def eval_cmd(
     seed: int = typer.Option(0, help="Must match the training seed to get the same split."),
     split_by: str = typer.Option("subject", metavar="MODE"),
     markdown: bool = typer.Option(False, help="Emit a markdown table for the README."),
+    cross: Path = typer.Option(
+        None,
+        help="A SECOND dataset dir to test on. Reports the in-domain vs out-of-domain gap.",
+    ),
 ) -> None:
     """Evaluate a checkpoint on the held-out test split.
 
     The threshold defaults to the one chosen on validation during training. Pass
     --threshold only to explore a different operating point, and label it as such
     if you report it.
+
+    With --cross, also evaluates on a dataset the model never trained on and
+    reports the gap. That gap is the number worth publishing: every PAD model
+    scores well in-domain, and the drop on unseen cameras and rooms is what says
+    whether it learned the phenomenon or just the dataset.
     """
     from trainyourface.eval.report import (
+        cross_dataset_report,
         evaluate_checkpoint,
         render_markdown_table,
         render_report,
@@ -407,11 +459,56 @@ def eval_cmd(
             fg=typer.colors.YELLOW,
         )
 
-    result = evaluate_checkpoint(checkpoint, test_s, root=data, threshold=thr)
+    result = evaluate_checkpoint(checkpoint, test_s, root=m.image_root(data), threshold=thr)
     if markdown:
         typer.echo(render_markdown_table(result))
     else:
         typer.echo(render_report(result, title="Test Set (subject-disjoint)"))
+
+    if cross is None:
+        return
+
+    # Cross-dataset: EVERY sample of the second dataset is test data, with no
+    # split at all. There is nothing to hold out — the model never saw any of it,
+    # which is the entire point. Splitting here would throw away most of the
+    # evaluation set for no gain.
+    cross_manifest = cross / "manifest.json"
+    if not cross_manifest.exists():
+        typer.secho(
+            f"no manifest at {cross_manifest}. --cross wants a second dataset "
+            "directory, e.g. your own captures when the model trained on CelebA.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    cross_m = DatasetManifest.load(cross_manifest)
+    if not cross_m.samples:
+        typer.secho(f"{cross_manifest} lists no samples", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    # An overlapping subject would make "out-of-domain" false in the same way the
+    # split-reconstruction bug made "held-out" false, so it is checked here too.
+    # Different datasets can genuinely reuse subject IDs — CelebA numbers its
+    # identities from 1, and so might a hand-built manifest.
+    shared = {s.subject for s in train_s} & {s.subject for s in cross_m.samples}
+    if shared:
+        typer.secho(
+            f"\nWARNING: {len(shared)} subject id(s) appear in BOTH the training "
+            f"data and --cross: {sorted(shared)[:5]}. If those are the same people, "
+            "this is not an out-of-domain test. If the two datasets just number "
+            "their subjects the same way, rename one side to make it verifiable.",
+            fg=typer.colors.YELLOW,
+        )
+
+    cross_result = evaluate_checkpoint(
+        checkpoint, cross_m.samples, root=cross_m.image_root(cross), threshold=thr
+    )
+    typer.echo(render_report(cross_result, title=f"Cross-dataset: {cross.name} (never trained on)"))
+    typer.echo(
+        cross_dataset_report(
+            result, cross_result, source_name=data.name or "train set", target_name=cross.name
+        )
+    )
 
 
 @app.command()

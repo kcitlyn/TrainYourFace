@@ -103,12 +103,21 @@ protection.
 
 ## Train your own liveness model
 
-The standard PAD datasets (CASIA-FASD, Replay-Attack, OULU-NPU, SiW) all need signed
-institutional licenses and can't be redistributed, so this ships a collector instead of
-a download link.
+Two data sources, and they answer different questions.
+
+**A public benchmark.** CelebA-Spoof — 625K images, 10,177 subjects — downloads directly
+with no license application, unlike CASIA-FASD / Replay-Attack / OULU-NPU / SiW, which
+all need signed institutional agreements. Non-commercial research use, per its terms.
 
 ```bash
-# Record yourself, then attacks against yourself. ~2 minutes each.
+tyf import-celeba ~/Downloads/CelebA_Spoof --limit 40000
+tyf train --epochs 30
+```
+
+**Your own camera.** The benchmark can't tell you whether the model survives *your*
+hardware.
+
+```bash
 tyf capture --label bona_fide --subject you --session day1
 tyf capture --label print     --subject you --session day1 --instrument laser_matte
 tyf capture --label replay    --subject you --session day1 --instrument iphone13
@@ -121,6 +130,30 @@ tyf export --format onnx     # verified against PyTorch on export
 
 Capture 3+ subjects across 2+ sessions. The split refuses to run below 3 subjects
 rather than silently produce a test set that shares people with train.
+
+### The evaluation that actually matters
+
+Train on one, test on the other:
+
+```bash
+tyf eval --data ~/celeba-manifest --cross ~/my-captures
+```
+
+Every PAD model scores well on the dataset it was built from — the frames share
+cameras, lighting, and attack instruments, so the model can lean on cues specific to
+that setup. The number that says whether it's deployable is what happens on a camera
+and a room it has never seen. This prints both side by side and names the failure mode:
+
+- **Discrimination collapse** — EER and AUC degrade. The model can't separate the
+  classes at *any* threshold; it learned the dataset, not the phenomenon.
+- **Calibration collapse** — EER holds steady while APCER/BPCER blow up. The model
+  still *ranks* attacks above real faces, but the score distribution shifted, so the
+  threshold carried over from training now sits in the wrong place.
+
+The second is more common and more dangerous, because the threshold-free metrics look
+pristine while every attack gets accepted. An early version of this report keyed its
+verdict on EER alone and cheerfully called a 0% → 100% worst-case APCER regression "the
+good outcome". That's now a test.
 
 ### What the training pipeline refuses to do
 
@@ -152,6 +185,11 @@ Every one of these is a way to get a better-looking number that means less:
   CPU. A number without an execution provider attached is unattributable, so `tyf
   bench` always prints it — plus median and p95, never mean, because on an edge device
   the tail is what breaks a frame budget.
+- **Quote one aggregate APCER.** A model at 3% overall can be at 30% in backlit
+  conditions — and backlit is exactly where someone holds up a phone screen. Where the
+  data carries capture metadata, APCER is broken out per illumination and environment,
+  worst bucket first. Buckets under n=20 print their raw count and *no rate*, because
+  "2 of 3 missed" reads as a 67% finding and is noise.
 
 ---
 
