@@ -113,6 +113,11 @@ def align_face(
     keypoints = np.asarray(keypoints, dtype=np.float32)
     if keypoints.shape != (5, 2):
         raise ValueError(f"expected (5, 2) keypoints, got {keypoints.shape}")
+    # Checked here rather than letting the SVD fail: non-finite landmarks surface
+    # as "LinAlgError: SVD did not converge" from inside umeyama_similarity, which
+    # names neither the keypoints nor the frame that produced them.
+    if not np.all(np.isfinite(keypoints)):
+        raise ValueError("keypoints contain NaN or inf; cannot compute an alignment")
 
     template = ARCFACE_TEMPLATE * (size / CROP_SIZE)
     matrix = umeyama_similarity(keypoints, template)
@@ -126,16 +131,22 @@ def crop_box(image: np.ndarray, box, size: int = CROP_SIZE, margin: float = 0.0)
     (including some background) rather than a tightly aligned crop: screen bezels,
     paper edges, and moiré patterns are exactly the cues that reveal a replay or
     print attack, and aggressive alignment crops them away.
+
+    Coordinates are clamped to the image on BOTH paths. This is not defensive
+    boilerplate: detectors routinely emit boxes running off the frame edge, and a
+    negative x1 makes `image[y1:y2, x1:x2]` a *negative index* — numpy reads from
+    the far side of the array and the slice comes back empty, so the function
+    returned an all-black crop for any face touching the left or top edge. The
+    liveness model then scored a black square instead of the face, and nothing
+    errored. The margin path happened to clamp already; the margin-free path (used
+    by the recognition fallback) did not.
     """
     import cv2
 
     h, w = image.shape[:2]
-    if margin:
-        dx, dy = int(box.width * margin), int(box.height * margin)
-        x1, y1 = max(0, box.x1 - dx), max(0, box.y1 - dy)
-        x2, y2 = min(w, box.x2 + dx), min(h, box.y2 + dy)
-    else:
-        x1, y1, x2, y2 = box.x1, box.y1, box.x2, box.y2
+    dx, dy = (int(box.width * margin), int(box.height * margin)) if margin else (0, 0)
+    x1, y1 = max(0, box.x1 - dx), max(0, box.y1 - dy)
+    x2, y2 = min(w, box.x2 + dx), min(h, box.y2 + dy)
 
     patch = image[y1:y2, x1:x2]
     if patch.size == 0:
