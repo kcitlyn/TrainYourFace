@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import typer
 
-from trainyourface.cli.overlay import draw_face, draw_hud
+from trainyourface.cli.overlay import ScoreHistory, draw_face, draw_hud
 from trainyourface.core.align import align_face
 
 # Enrollment quality gates. A blurry or tiny enrollment frame produces a bad
@@ -66,7 +66,10 @@ def run_watch(
     for line in pipeline.describe():
         typer.echo(f"  {line}")
     typer.echo()
-    typer.secho("  q quit    s screenshot", fg=typer.colors.BRIGHT_BLACK)
+    typer.secho(
+        "  q quit    s screenshot    SPACE pause    l legend    t trace    h hud",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
     typer.echo()
 
     warn = None
@@ -75,31 +78,70 @@ def run_watch(
     elif identify_spoofs:
         warn = "--identify-spoofs: identities shown for rejected faces (eval mode)"
 
+    subtitle = "trainyourface" + ("" if pipeline.liveness else "  (recognition only)")
+    keys = "q quit  s shot  SPACE pause  l legend"
+
     cap = open_camera(camera)
+    history = ScoreHistory()
     shots = 0
+    # Legend defaults on only when there's no liveness model: that's the case
+    # where the states need explaining, since UNVERIFIED is the confusing one.
+    legend = pipeline.liveness is None
+    trace = True
+    show_hud = True
+    paused = False
+
+    # The last raw frame and its result are kept separately from the rendered
+    # view. Pausing then re-renders from those instead of re-annotating an
+    # already-annotated image, so toggling the HUD or legend while paused works
+    # and screenshots never contain doubled overlays.
+    frame: np.ndarray | None = None
+    result = None
+
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                typer.secho("camera read failed", fg=typer.colors.RED, err=True)
-                break
-            if mirror:
-                frame = cv2.flip(frame, 1)
+            if not paused or frame is None:
+                ok, grabbed = cap.read()
+                if not ok:
+                    typer.secho("camera read failed", fg=typer.colors.RED, err=True)
+                    break
+                frame = cv2.flip(grabbed, 1) if mirror else grabbed
+                result = pipeline.process(frame)
+                for face in result.faces:
+                    if face.liveness is not None:
+                        history.push(face.box, face.liveness.spoof_probability)
 
-            result = pipeline.process(frame)
             view = frame.copy()
             for face in result.faces:
-                draw_face(view, face)
-            draw_hud(view, result, warn=warn)
+                draw_face(view, face, history=history, show_trace=trace)
+            if show_hud:
+                draw_hud(
+                    view,
+                    result,
+                    warn=warn,
+                    keys=keys,
+                    subtitle=subtitle,
+                    legend=legend,
+                    paused=paused,
+                )
 
             cv2.imshow("trainyourface", view)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+
+            if key in (ord("q"), 27):  # q or Esc
                 break
-            if key == ord("s"):
+            if key == ord(" "):
+                paused = not paused
+            elif key == ord("l"):
+                legend = not legend
+            elif key == ord("t"):
+                trace = not trace
+            elif key == ord("h"):
+                show_hud = not show_hud
+            elif key == ord("s"):
                 out = Path(f"screenshot_{shots:03d}.png")
                 cv2.imwrite(str(out), view)
-                typer.echo(f"saved {out}")
+                typer.secho(f"  saved {out}", fg=typer.colors.GREEN)
                 shots += 1
     finally:
         cap.release()
@@ -154,13 +196,14 @@ def run_enroll(
         typer.echo(f"  {name} already has {store.count_for(name)} samples; adding to them.")
     typer.echo(f"  Need {samples} good frames. Turn your head slowly between captures —")
     typer.echo("  varied pose is what makes the template robust.")
-    typer.secho("  SPACE capture    a auto-capture    q abort", fg=typer.colors.YELLOW)
+    typer.secho("  SPACE capture    a auto-capture    u undo    q abort", fg=typer.colors.YELLOW)
     typer.echo()
 
     cap = open_camera(camera)
     collected: list[np.ndarray] = []
-    auto = False
+    auto = True  # on by default: it produces better pose variety than manual timing
     cooldown = 0
+    flash = 0
 
     try:
         while len(collected) < samples:
@@ -175,23 +218,32 @@ def run_enroll(
             reason = _reject_reason(frame, face, require_live)
             view = frame.copy()
             for f in result.faces:
-                draw_face(view, f)
+                draw_face(view, f, show_trace=False)
 
-            status = reason or "READY - press SPACE"
-            draw_hud(
+            _draw_enroll_guide(
                 view,
-                result,
-                extra=[f"enrolling {name}", f"{len(collected)}/{samples} captured", status],
-                warn="auto-capture ON" if auto else None,
+                name=name,
+                collected=len(collected),
+                target=samples,
+                reason=reason,
+                auto=auto,
+                cooldown=cooldown,
+                flash=flash,
+                face=face,
             )
+            draw_hud(view, result, keys="SPACE capture  a auto  u undo  q abort")
             cv2.imshow("tyf enroll", view)
+            flash = max(0, flash - 1)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if key in (ord("q"), 27):
                 typer.secho("aborted; nothing saved", fg=typer.colors.YELLOW)
                 return
             if key == ord("a"):
                 auto = not auto
+            if key == ord("u") and collected:
+                collected.pop()
+                typer.echo(f"  undo -> {len(collected)}/{samples}")
             if key == ord(" "):
                 cooldown = 0
 
@@ -202,6 +254,7 @@ def run_enroll(
                 if crop is not None:
                     collected.append(crop)
                     typer.echo(f"  captured {len(collected)}/{samples}")
+                    flash = 4
                     # Frames this close together are near-duplicates; the store
                     # would dedup them anyway, so waiting produces varied poses
                     # instead of ten copies of one.
@@ -226,6 +279,86 @@ def run_enroll(
         typer.echo(f"  ({len(collected) - kept} dropped as near-duplicates of existing samples)")
     typer.echo(f"  {name} now has {store.count_for(name)} samples")
     typer.echo(f"  store: {store.path}")
+
+
+def _draw_enroll_guide(
+    frame: np.ndarray,
+    *,
+    name: str,
+    collected: int,
+    target: int,
+    reason: str | None,
+    auto: bool,
+    cooldown: int,
+    flash: int,
+    face,
+) -> None:
+    """Enrollment-specific overlay: progress dots and what to fix.
+
+    Dots rather than a percentage bar because the counts here are small (8 by
+    default) and a discrete "3 of 8 captured" is easier to read at a glance than
+    37%. The rejection reason is shown large and centred — enrollment is the one
+    place a user is actively trying to satisfy the tool, so telling them exactly
+    what's wrong is the whole job.
+    """
+    import cv2
+
+    from trainyourface.cli.theme import (
+        AMBER,
+        DIM,
+        GREEN,
+        PANEL,
+        TRACK,
+        WHITE,
+        panel,
+        pill,
+        text,
+        text_size,
+    )
+
+    h, w = frame.shape[:2]
+
+    # A white flash on capture, so it's obvious a frame was taken. Without it,
+    # auto-capture feels like nothing is happening.
+    if flash:
+        cv2.addWeighted(frame, 0.75, np.full_like(frame, 255), 0.25, 0, frame)
+
+    header = f"enrolling {name}"
+    hw = text_size(header, 0.5, 1)[0]
+    dot_r, gap = 7, 22
+    dots_w = target * gap
+    box_w = max(hw, dots_w) + 32
+    x0 = (w - box_w) // 2
+    panel(frame, (x0, h - 96), (x0 + box_w, h - 20), PANEL, alpha=0.72)
+
+    text(frame, header, ((w - hw) // 2, h - 66), WHITE, scale=0.5)
+    dx = (w - dots_w) // 2 + gap // 2
+    for i in range(target):
+        filled = i < collected
+        cv2.circle(
+            frame,
+            (dx + i * gap, h - 42),
+            dot_r,
+            GREEN if filled else TRACK,
+            -1 if filled else 1,
+            cv2.LINE_AA,
+        )
+
+    if auto:
+        badge = "AUTO" if cooldown <= 0 else f"AUTO {cooldown}"
+        pill(frame, badge, (x0 + box_w + 8, h - 90), GREEN if cooldown <= 0 else DIM, scale=0.4)
+
+    # The blocker, or an explicit ready state. Never blank: silence during
+    # enrollment reads as a frozen program.
+    if reason:
+        msg, color = reason, AMBER
+    elif face is None:
+        msg, color = "no face detected", AMBER
+    else:
+        msg, color = "hold still - capturing", GREEN
+    mw = text_size(msg, 0.55, 1)[0]
+    panel(frame, ((w - mw) // 2 - 16, 54), ((w + mw) // 2 + 16, 90), PANEL, alpha=0.78)
+    text(frame, msg, ((w - mw) // 2, 79), color, scale=0.55)
 
 
 def _keypoints_for(pipeline, frame, face) -> np.ndarray | None:
