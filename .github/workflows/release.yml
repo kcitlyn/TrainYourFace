@@ -1,0 +1,151 @@
+# Publish to PyPI on a version tag, via Trusted Publishing.
+#
+# No API token exists anywhere — not on a laptop, not in repository secrets.
+# GitHub mints a short-lived OIDC identity token for this specific
+# repo+workflow+environment, and PyPI verifies it against the publisher you
+# configured at pypi.org/manage/account/publishing/. A leaked long-lived token is
+# the most common way a package gets hijacked, so the fix is to not have one.
+#
+# ONE-TIME SETUP before the first tag will work:
+#   1. pypi.org/manage/account/publishing/ -> add a pending publisher
+#        PyPI project name: trainyourface
+#        Owner:             kcitlyn
+#        Repository:        TrainYourFace
+#        Workflow:          release.yml
+#        Environment:       pypi
+#   2. GitHub repo Settings -> Environments -> New environment -> "pypi"
+#        Optionally require a reviewer, which makes publishing a two-step
+#        confirmation rather than a side effect of pushing a tag.
+#
+# Then, to release:
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# A published version is PERMANENT. It can be yanked (hidden from resolvers) but
+# the files stay downloadable and the version number can never be reused, so a
+# mistake ships as the next patch release rather than a re-upload. That is why the
+# tag/metadata agreement below is checked before anything is uploaded.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # The tag is the only thing a human types, so it is the thing most likely to be
+  # wrong. Tagging v0.3.0 while pyproject.toml still says 0.2.0 would publish
+  # 0.2.0 under a 0.3.0 tag — and burn 0.2.0 permanently in the process, since
+  # the real 0.2.0 could then never be uploaded. Checked first, cheaply.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the version in pyproject.toml
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PROJ=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          echo "tag=$TAG  pyproject=$PROJ"
+          if [ "$TAG" != "$PROJ" ]; then
+            echo "::error::tag v$TAG does not match pyproject.toml version $PROJ."
+            echo "::error::Publishing would permanently burn the wrong version number."
+            exit 1
+          fi
+
+      - name: Refuse to republish an existing version
+        # PyPI rejects a duplicate upload anyway, but it does so after the build,
+        # with an error that reads like a transient failure. Failing here says
+        # plainly that the version needs bumping.
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/trainyourface/$TAG/json")
+          if [ "$CODE" = "200" ]; then
+            echo "::error::trainyourface $TAG is already on PyPI. Versions are"
+            echo "::error::immutable — bump the version in pyproject.toml instead."
+            exit 1
+          fi
+
+  # The full suite runs again here rather than trusting the CI run on main. A tag
+  # can point at any commit, including one that never went through a PR.
+  test:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with all extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[train,export]" pytest ruff
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+      - name: Test, including the end-to-end train/export run
+        run: pytest -q -m "not camera and not slow"
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+
+      - name: The wheel must install and run without a compiler
+        # The project's headline claim, checked against the exact artifact about
+        # to be published rather than against the repository.
+        run: |
+          uv venv /tmp/check
+          uv pip install --python /tmp/check/bin/python dist/*.whl
+          /tmp/check/bin/tyf --help
+          /tmp/check/bin/tyf info
+          /tmp/check/bin/python -c "
+          import os, trainyourface
+          marker = os.path.join(os.path.dirname(trainyourface.__file__), 'py.typed')
+          assert os.path.exists(marker), 'py.typed missing; Typing::Typed would be a false claim'
+          print('py.typed present')
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Named environment so the trusted publisher can be scoped to it, and so a
+    # required reviewer can be added later without touching this file.
+    environment: pypi
+    permissions:
+      # The OIDC token PyPI verifies. This is the whole mechanism — no secrets.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Attach the published artifacts to a GitHub release
+        # Same files that went to PyPI, so the two can be compared byte-for-byte
+        # if anyone ever needs to verify what was shipped.
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

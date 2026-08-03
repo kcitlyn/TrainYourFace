@@ -6,8 +6,8 @@
 # source folder instead of the installed package.
 #
 # The dependency story here IS the product. The whole point of this project is
-# that `pip install trainyourface` works with no CMake, no C++ toolchain, and no
-# dlib — so the core deps are deliberately restricted to things that ship
+# that installing it needs no CMake, no C++ toolchain, and no dlib — so the core
+# deps are deliberately restricted to things that ship
 # prebuilt wheels on every platform we target (macOS arm64, Linux x86_64,
 # linux-aarch64 for Raspberry Pi). Torch is NOT a core dep: inference runs on
 # ONNX Runtime alone, and training lives behind the [train] extra.
@@ -29,18 +29,35 @@ keywords = [
     "anti-spoofing",
     "liveness-detection",
     "presentation-attack-detection",
+    "face-anti-spoofing",
+    "biometrics",
     "onnx",
     "edge-ai",
     "coreml",
     "offline",
 ]
+# Specific versions are listed rather than bare "Python :: 3" because PyPI's
+# left-hand filters key on the exact entries, so a bare 3 is invisible to anyone
+# narrowing by version. The range must match requires-python or the page
+# contradicts the resolver.
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Security",
     "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Typing :: Typed",
 ]
+
 
 # Core = inference only, and every one of these has prebuilt wheels for
 # macOS arm64 / linux x86_64 / linux aarch64. No build step, ever.
@@ -83,6 +100,15 @@ export = [
 # Installing this replaces the headless build.
 demo = ["opencv-python>=4.9"]
 
+# Without these the PyPI page has no link back to the repository, which for this
+# project is most of the point — the argument for it is in the code and the
+# metrics, not in a package description.
+[project.urls]
+Homepage = "https://github.com/kcitlyn/TrainYourFace"
+Repository = "https://github.com/kcitlyn/TrainYourFace"
+Issues = "https://github.com/kcitlyn/TrainYourFace/issues"
+Changelog = "https://github.com/kcitlyn/TrainYourFace/releases"
+
 [dependency-groups]
 # Dev tooling (uv installs these by default with `uv sync`).
 dev = ["pytest>=8", "ruff>=0.6", "pytest-cov>=5"]
@@ -93,6 +119,15 @@ tyf = "trainyourface.cli.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trainyourface"]
+# py.typed ships the "this package has real annotations" marker; without it in the
+# wheel, mypy/pyright ignore every type in here and the Typing::Typed classifier
+# on the PyPI page would be claiming something users can't actually use.
+artifacts = ["src/trainyourface/py.typed"]
+
+# The sdist otherwise carries .github/, .gitignore and .python-version — harmless,
+# since they're in the public repo anyway, but they aren't part of the package.
+[tool.hatch.build.targets.sdist]
+include = ["src/trainyourface", "tests", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.ruff]
 line-length = 100
