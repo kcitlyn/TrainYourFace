@@ -157,11 +157,16 @@ class LivenessModel:
     def _init_torch(self, path: Path) -> None:
         import torch
 
-        from trainyourface.liveness.model import ModelConfig, build_model, pick_device
+        from trainyourface.liveness.model import (
+            ModelConfig,
+            build_model,
+            load_checkpoint,
+            pick_device,
+        )
 
         self._torch = torch
         self._device = pick_device()
-        ckpt = torch.load(path, map_location=self._device, weights_only=False)
+        ckpt = load_checkpoint(path, map_location=self._device)
         cfg = ModelConfig(**ckpt["model_config"])
         model = build_model(cfg).to(self._device)
         model.load_state_dict(ckpt["model_state"])

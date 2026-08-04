@@ -396,10 +396,10 @@ def evaluate_checkpoint(
     from torch.utils.data import DataLoader
 
     from trainyourface.liveness.dataset import PADDataset
-    from trainyourface.liveness.model import ModelConfig, build_model, pick_device
+    from trainyourface.liveness.model import ModelConfig, build_model, load_checkpoint, pick_device
 
     dev = pick_device(device)
-    ckpt = torch.load(checkpoint, map_location=dev, weights_only=False)
+    ckpt = load_checkpoint(checkpoint, map_location=dev)
     cfg = ModelConfig(**ckpt["model_config"])
     model = build_model(cfg).to(dev)
     model.load_state_dict(ckpt["model_state"])

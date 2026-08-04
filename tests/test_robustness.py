@@ -25,6 +25,8 @@ happen, which is why each one is pinned rather than fixed and forgotten.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -526,3 +528,438 @@ class TestBoxScaledDegenerate:
     def test_normal_scaling_is_exact(self):
         out = box(10, 20, 110, 220).scaled(2.0, 0.5)
         assert (out.x1, out.y1, out.x2, out.y2) == (20, 10, 220, 110)
+
+
+class TestManifestPortability:
+    """A manifest is a committable, cross-machine artifact — so it must survive
+    the machine that wrote it.
+
+    SILENTLY WRONG: `tyf capture` built paths with `str(Path("images") / label /
+    name)`, which on Windows produces `images\\bona_fide\\s1_0.png`. Read back on
+    macOS or Linux that is a SINGLE filename containing backslashes, not a path:
+    every image read fails and the subject parser can't find the identity dir. The
+    project's whole premise is cross-platform, so a manifest that only works on the
+    OS that made it is a real defect.
+    """
+
+    def test_a_windows_path_is_normalized_on_construction(self):
+        from trainyourface.core.contracts import AttackType
+        from trainyourface.liveness.dataset import Sample
+
+        s = Sample(
+            path="images\\bona_fide\\s1_0.png", attack_type=AttackType.BONA_FIDE, subject="s"
+        )
+        assert s.path == "images/bona_fide/s1_0.png"
+
+    def test_a_posix_path_is_left_alone(self):
+        from trainyourface.core.contracts import AttackType
+        from trainyourface.liveness.dataset import Sample
+
+        s = Sample(path="images/bona_fide/s1_0.png", attack_type=AttackType.BONA_FIDE, subject="s")
+        assert s.path == "images/bona_fide/s1_0.png"
+
+    def test_a_windows_manifest_round_trips_to_forward_slashes(self, tmp_path):
+        from trainyourface.core.contracts import AttackType
+        from trainyourface.liveness.dataset import DatasetManifest, Sample
+
+        m = DatasetManifest(
+            samples=[Sample("Data\\train\\7\\live\\1.png", AttackType.BONA_FIDE, "7")],
+            root=str(tmp_path),
+        )
+        m.save(tmp_path / "manifest.json")
+        reloaded = DatasetManifest.load(tmp_path / "manifest.json")
+        assert reloaded.samples[0].path == "Data/train/7/live/1.png"
+
+    def test_a_windows_celeba_path_still_yields_its_subject(self):
+        """The subject parser splits on '/', so a normalized path is what lets it
+        find the identity directory regardless of the capture OS."""
+        from trainyourface.core.contracts import AttackType
+        from trainyourface.liveness.celeba_spoof import _subject_from_path
+        from trainyourface.liveness.dataset import Sample
+
+        s = Sample("Data\\train\\1234\\live\\1.png", AttackType.BONA_FIDE, "x")
+        assert _subject_from_path(s.path) == "1234"
+
+
+class TestManifestLoadValidation:
+    """A manifest gets hand-edited, script-generated, and git-merged, so "it
+    parsed" is not "it is usable".
+
+    CRASHES FAR FROM THE CAUSE: every malformed manifest used to surface as a raw
+    JSONDecodeError, KeyError, or AttributeError naming a dict key or a byte
+    offset. The worst was a non-dict `conditions`, which passed straight through
+    load() and died later inside `fairness_audit` as `'str' object has no attribute
+    'items'` — arbitrarily far from the file that caused it.
+    """
+
+    @staticmethod
+    def _write(tmp_path, content):
+        p = tmp_path / "manifest.json"
+        p.write_text(content)
+        return p
+
+    def test_corrupt_json_names_the_file(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        with pytest.raises(ValueError, match="not valid JSON"):
+            DatasetManifest.load(self._write(tmp_path, "hello{"))
+
+    def test_a_top_level_array_is_rejected(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        with pytest.raises(ValueError, match="must contain a JSON object"):
+            DatasetManifest.load(self._write(tmp_path, "[1, 2, 3]"))
+
+    def test_samples_must_be_a_list(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        with pytest.raises(ValueError, match="'samples' must be a list"):
+            DatasetManifest.load(self._write(tmp_path, '{"samples": "nope"}'))
+
+    def test_a_missing_required_field_names_it(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        content = '{"samples":[{"attack_type":"bona_fide","subject":"s"}]}'
+        with pytest.raises(ValueError, match="missing required field.*path"):
+            DatasetManifest.load(self._write(tmp_path, content))
+
+    def test_an_unknown_attack_type_lists_the_valid_ones(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        content = '{"samples":[{"path":"a.png","attack_type":"laser","subject":"s"}]}'
+        with pytest.raises(ValueError, match="not one of"):
+            DatasetManifest.load(self._write(tmp_path, content))
+
+    def test_non_dict_conditions_are_caught_at_load_not_in_the_report(self, tmp_path):
+        """The whole point: fail at the file, not three modules downstream."""
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        content = (
+            '{"samples":[{"path":"a.png","attack_type":"bona_fide","subject":"s",'
+            '"conditions":"attr:Male"}]}'
+        )
+        with pytest.raises(ValueError, match="'conditions' of type str"):
+            DatasetManifest.load(self._write(tmp_path, content))
+
+    def test_a_null_root_normalizes_to_empty_string(self, tmp_path):
+        """root=None would break image_root()'s Path(self.root). Coerced to ''."""
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        m = DatasetManifest.load(self._write(tmp_path, '{"root":null,"samples":[]}'))
+        assert m.root == ""
+        assert m.image_root(tmp_path) == tmp_path
+
+    def test_a_valid_manifest_still_loads(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        content = (
+            '{"root":"/x","samples":[{"path":"a.png","attack_type":"bona_fide","subject":"s"}]}'
+        )
+        m = DatasetManifest.load(self._write(tmp_path, content))
+        assert len(m.samples) == 1 and m.root == "/x"
+
+
+class TestCorruptManifestThroughTheCLI:
+    """A malformed manifest must be a message, not a traceback with no output.
+
+    The commands exited 1 only because typer catches the escaping ValueError; the
+    user saw a stack and no explanation. Someone hand-editing a manifest should be
+    told what's wrong with it.
+    """
+
+    def _bad(self, tmp_path):
+        (tmp_path / "manifest.json").write_text("hello{")
+        return tmp_path
+
+    def test_manifest_command_explains_it(self, tmp_path):
+        from typer.testing import CliRunner
+
+        from trainyourface.cli.main import app
+
+        result = CliRunner().invoke(app, ["manifest", "--data", str(self._bad(tmp_path))])
+        assert result.exit_code == 1
+        assert "not valid JSON" in result.output
+        assert not isinstance(result.exception, Exception) or isinstance(
+            result.exception, SystemExit
+        )
+
+    def test_train_command_explains_it(self, tmp_path):
+        from typer.testing import CliRunner
+
+        from trainyourface.cli.main import app
+
+        result = CliRunner().invoke(
+            app, ["train", "--data", str(self._bad(tmp_path)), "--epochs", "1"]
+        )
+        assert result.exit_code == 1
+        assert "not valid JSON" in result.output
+
+
+class TestCheckpointDeserialization:
+    """A PyTorch checkpoint is a pickle, so loading one runs code from it.
+
+    ARBITRARY CODE EXECUTION: all four load sites passed `weights_only=False`,
+    which lets a crafted `.pt` execute anything via `__reduce__` on load. This is
+    not theoretical — the test below builds such a file and confirms the payload is
+    blocked. The exposure is direct: `tyf eval --checkpoint someone-elses.pt` is
+    the documented way to reproduce a reported number, and PAD models are exactly
+    the artifact people pass around.
+
+    Nothing is lost by restricting it: these checkpoints hold tensors, plain dicts,
+    ints and floats, all of which `weights_only=True` permits.
+    """
+
+    pytestmark = pytest.mark.train
+
+    def test_a_malicious_checkpoint_cannot_execute_code(self, tmp_path):
+        """The payload is a local file touch, standing in for a real one."""
+        import os
+
+        import torch
+
+        from trainyourface.liveness.model import load_checkpoint
+
+        marker = tmp_path / "EXECUTED"
+
+        class Payload:
+            def __reduce__(self):
+                return (os.system, (f"touch {marker}",))
+
+        evil = tmp_path / "evil.pt"
+        torch.save({"model_state": Payload(), "model_config": {}}, evil)
+
+        with pytest.raises(ValueError, match="could not safely load"):
+            load_checkpoint(evil, map_location="cpu")
+        assert not marker.exists(), "code from the checkpoint ran"
+
+    def test_the_error_names_the_escape_hatch_without_taking_it(self, tmp_path):
+        """A trusted-but-odd checkpoint should be recoverable, but only
+        deliberately. Silently retrying with weights_only=False would defeat the
+        whole guard, so the message explains add_safe_globals instead."""
+        import os
+
+        import torch
+
+        from trainyourface.liveness.model import load_checkpoint
+
+        class Payload:
+            def __reduce__(self):
+                return (os.system, ("true",))
+
+        evil = tmp_path / "odd.pt"
+        torch.save({"x": Payload()}, evil)
+        with pytest.raises(ValueError) as exc:
+            load_checkpoint(evil, map_location="cpu")
+        assert "add_safe_globals" in str(exc.value)
+
+    def test_a_legitimate_checkpoint_still_loads(self, tmp_path):
+        """The guard must not break the normal path."""
+        import torch
+
+        from trainyourface.liveness.model import load_checkpoint
+
+        good = tmp_path / "good.pt"
+        torch.save(
+            {
+                "model_state": {"w": torch.zeros(2, 2)},
+                "model_config": {"width": 16},
+                "epoch": 3,
+                "val_eer": 0.05,
+            },
+            good,
+        )
+        ckpt = load_checkpoint(good, map_location="cpu")
+        assert ckpt["epoch"] == 3
+        assert ckpt["model_config"]["width"] == 16
+
+    def test_no_unsafe_load_remains_in_the_source(self):
+        """A guard against reintroduction. `weights_only=False` is one word in a
+        diff and reopens the hole completely, which is easy to miss in review.
+
+        Parsed with `ast` rather than grepped: the docstrings that explain this
+        vulnerability necessarily contain the string, and a text search flags them
+        as offenders. Matching actual keyword arguments in real calls is the check
+        that means something.
+        """
+        import ast
+        from pathlib import Path
+
+        src = Path(__file__).resolve().parent.parent / "src"
+        offenders = []
+        for path in src.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                for kw in node.keywords:
+                    if (
+                        kw.arg == "weights_only"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is False
+                    ):
+                        offenders.append(f"{path.relative_to(src)}:{node.lineno}")
+        assert not offenders, f"unsafe torch.load at {offenders}"
+
+    def test_that_guard_would_actually_catch_a_regression(self):
+        """Verifies the detector, not the codebase.
+
+        A source-scanning test that silently matches nothing is worthless — it
+        passes forever regardless of what the code does. This feeds it a known-bad
+        snippet to prove the AST walk finds one.
+        """
+        import ast
+
+        tree = ast.parse("torch.load(p, map_location='cpu', weights_only=False)")
+        found = [
+            kw
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            for kw in node.keywords
+            if kw.arg == "weights_only"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value is False
+        ]
+        assert len(found) == 1
+
+
+class TestBiometricDataAtRest:
+    """Face embeddings are biometric identifiers, and unlike a password you
+    cannot issue someone a new face.
+
+    The store was written with the default 0o644, leaving templates readable by
+    every local user and process. The default directory is 0o700, which masks the
+    problem until someone passes `--store` somewhere else.
+    """
+
+    # POSIX only. On Windows `os.chmod` can only toggle the read-only flag — the
+    # permission bits are emulated and always report group/other as readable
+    # (0o666), so asserting 0o600 there tests the emulation, not this code. The
+    # source comment already said this; the first version of these tests ignored it
+    # and failed both Windows jobs. Confidentiality on Windows rests on the user
+    # profile directory's ACL instead.
+    posix_only = pytest.mark.skipif(
+        os.name != "posix", reason="POSIX permission bits are emulated on Windows"
+    )
+
+    @posix_only
+    def test_the_store_is_owner_only(self, tmp_path):
+        import stat
+
+        from trainyourface.core.store import EnrollmentStore
+
+        path = tmp_path / "enrollments.npz"
+        s = EnrollmentStore(path)
+        s.add("kc", np.zeros((1, 512), dtype=np.float32))
+        s.save()
+
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert not mode & stat.S_IROTH, "world-readable biometric templates"
+        assert not mode & stat.S_IRGRP, "group-readable biometric templates"
+
+    @posix_only
+    def test_permissions_survive_a_rewrite(self, tmp_path):
+        """save() replaces the file, so the mode has to be reapplied each time."""
+        import stat
+
+        from trainyourface.core.store import EnrollmentStore
+
+        path = tmp_path / "enrollments.npz"
+        s = EnrollmentStore(path)
+        s.add("a", np.zeros((1, 512), dtype=np.float32))
+        s.save()
+        s.add("b", np.ones((1, 512), dtype=np.float32))
+        s.save()
+        assert not stat.S_IMODE(path.stat().st_mode) & stat.S_IROTH
+
+    def test_the_chmod_is_attempted_on_every_platform(self, tmp_path, monkeypatch):
+        """Windows can't enforce the mode, but the call must still be made.
+
+        Skipping the two tests above on Windows would otherwise leave the chmod
+        itself untested there — so a refactor that dropped it would go unnoticed on
+        that platform. This asserts the attempt, which is platform-independent.
+        """
+        from pathlib import Path
+
+        from trainyourface.core.store import EnrollmentStore
+
+        seen: list[int] = []
+        real_chmod = Path.chmod
+
+        def spy(self, mode, **kwargs):
+            seen.append(mode)
+            return real_chmod(self, mode, **kwargs)
+
+        monkeypatch.setattr(Path, "chmod", spy)
+        s = EnrollmentStore(tmp_path / "enrollments.npz")
+        s.add("kc", np.zeros((1, 512), dtype=np.float32))
+        s.save()
+        assert 0o600 in seen, "save() must restrict the biometric store's mode"
+
+    def test_the_store_still_round_trips(self, tmp_path):
+        from trainyourface.core.store import EnrollmentStore
+
+        path = tmp_path / "enrollments.npz"
+        s = EnrollmentStore(path)
+        s.add("kc", np.zeros((1, 512), dtype=np.float32))
+        s.save()
+        assert EnrollmentStore(path).identities == ["kc"]
+
+    def test_the_store_refuses_pickled_arrays(self):
+        """np.load(allow_pickle=True) is the numpy equivalent of the torch hole.
+
+        Asserted at the source level: an .npz is a zip of .npy files, and with
+        pickle allowed a crafted store would execute code the same way.
+        """
+        from pathlib import Path
+
+        src = Path(__file__).resolve().parent.parent / "src"
+        offenders = [str(p) for p in src.rglob("*.py") if "allow_pickle=True" in p.read_text()]
+        assert not offenders, f"unsafe np.load at {offenders}"
+
+
+class TestDownloadBounds:
+    """SHA-256 verification is the real defence for downloads, and it is already
+    in place for both the archive and the extracted member.
+
+    This covers the narrower gap: bytes are streamed to disk BEFORE the hash is
+    checked, so without a cap a hostile mirror or a zip bomb could fill the cache
+    directory even though the result would then be rejected.
+    """
+
+    def test_an_oversized_stream_is_aborted(self):
+        import io
+
+        from trainyourface.core.models import ModelDownloadError, _copy_bounded
+
+        with pytest.raises(ModelDownloadError, match="exceeded"):
+            _copy_bounded(io.BytesIO(b"x" * 5000), io.BytesIO(), limit=1000, what="test")
+
+    def test_a_normal_stream_passes_through_intact(self):
+        import io
+
+        from trainyourface.core.models import _copy_bounded
+
+        out = io.BytesIO()
+        _copy_bounded(io.BytesIO(b"y" * 500), out, limit=1000)
+        assert out.getvalue() == b"y" * 500
+
+    def test_the_cap_leaves_real_headroom(self):
+        """The artifacts total ~17 MB. A cap near that would break on a legitimate
+        model update; one in the gigabytes would not be a cap."""
+        from trainyourface.core.models import MAX_ARTIFACT_BYTES
+
+        assert 50 * 1024 * 1024 < MAX_ARTIFACT_BYTES < 1024 * 1024 * 1024
+
+    def test_every_model_url_uses_tls(self):
+        from trainyourface.core.models import DETECTOR, EMBEDDER
+
+        for spec in (DETECTOR, EMBEDDER):
+            assert spec.url.startswith("https://"), f"{spec.name} downloads over plaintext"
+
+    def test_every_model_is_hash_pinned(self):
+        """An unpinned artifact means a replaced upstream release goes unnoticed."""
+        from trainyourface.core.models import DETECTOR, EMBEDDER
+
+        for spec in (DETECTOR, EMBEDDER):
+            assert spec.sha256, f"{spec.name} has no expected hash"
+            if spec.archive_member:
+                assert spec.archive_sha256, f"{spec.name} archive is unpinned"

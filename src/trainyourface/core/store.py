@@ -26,6 +26,7 @@ of the binary form, parsed on every access.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from datetime import datetime, timezone
@@ -138,6 +139,14 @@ class EnrollmentStore:
         reader either sees the old complete file or the new complete file — never
         a truncated one. The old code's bare `open(path, "w")` from a thread could
         leave a half-written JSON file that failed to parse on next start.
+
+        The file is written owner-only (0o600). Face embeddings are biometric
+        identifiers — regulated as such under GDPR Art. 9 and BIPA — and the
+        default 0o644 left them readable by every local user and process on the
+        machine. They are also not revocable the way a password is: you cannot
+        issue someone a new face. The default store directory is already 0o700,
+        but that does not help when `--store` points somewhere else, so the
+        permission is set on the file itself.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".npz.tmp")
@@ -154,6 +163,11 @@ class EnrollmentStore:
                 meta=np.array(json.dumps(self._meta)),
                 threshold=np.array(self.match_threshold),
             )
+        # Restrict BEFORE the rename, so the file is never briefly world-readable
+        # at its final path. chmod is a no-op for permissions on Windows, where
+        # this instead relies on the user profile directory's own ACL.
+        with contextlib.suppress(OSError):  # pragma: no cover - unusual filesystems
+            tmp.chmod(0o600)
         tmp.replace(self.path)
 
     # ---- introspection -----------------------------------------------------

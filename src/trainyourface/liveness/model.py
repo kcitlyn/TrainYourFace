@@ -150,6 +150,45 @@ def count_parameters(model) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def load_checkpoint(path, map_location=None) -> dict:
+    """Load a `.pt` checkpoint without executing code from it.
+
+    A PyTorch checkpoint is a pickle, and `torch.load(..., weights_only=False)`
+    runs whatever `__reduce__` the file asks it to. This is not theoretical: I
+    built a checkpoint whose load touches a file on disk, and it ran. The same
+    payload with `weights_only=True` raises UnpicklingError instead.
+
+    That matters here specifically because sharing checkpoints is a workflow this
+    project encourages — `tyf eval --checkpoint` pointed at someone else's model is
+    the documented way to reproduce a reported number, and PAD models are exactly
+    the kind of artifact people pass around. Opening one should not be equivalent
+    to running an unknown script.
+
+    Nothing is given up by restricting it: these checkpoints hold tensors, plain
+    dicts, ints and floats, all of which `weights_only=True` allows. If a future
+    checkpoint needs a custom class, the fix is `torch.serialization`'s explicit
+    allowlist for that class, not turning the guard off globally.
+    """
+    import torch
+
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except Exception as exc:  # noqa: BLE001 - torch raises several types here
+        # Do NOT fall back to weights_only=False. A checkpoint that fails to load
+        # safely is either from an older/odd producer or is hostile, and this code
+        # cannot tell those apart — so it reports rather than guesses, and names
+        # the escape hatch instead of taking it silently.
+        raise ValueError(
+            f"could not safely load {path}: {exc}\n"
+            "This checkpoint contains objects beyond tensors and plain data. It is "
+            "loaded with weights_only=True because a PyTorch checkpoint is a pickle "
+            "and can execute code on load. If you produced this file yourself and "
+            "trust it, re-save it with `torch.save(ckpt, path)` from a current "
+            "version, or allowlist the specific class via "
+            "torch.serialization.add_safe_globals()."
+        ) from exc
+
+
 def pick_device(prefer: str | None = None):
     """Choose a training device.
 
