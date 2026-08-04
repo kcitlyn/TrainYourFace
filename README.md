@@ -288,7 +288,7 @@ the one worth quoting.
 ## Tests
 
 ```bash
-pytest                        # 421 tests
+pytest                        # 435 tests
 pytest -m train               # + the end-to-end run (trains a real model, ~3 min)
 pytest --cov=trainyourface    # 78% total
 ```

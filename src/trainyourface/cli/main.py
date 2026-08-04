@@ -32,6 +32,24 @@ DEFAULT_RUN_DIR = Path("runs/liveness")
 DEFAULT_DATA_DIR = Path("data/pad")
 
 
+def _load_manifest(path: Path):
+    """Load a manifest, turning a malformed one into a message, not a traceback.
+
+    `DatasetManifest.load` now raises ValueError with a file-and-field diagnostic
+    for corrupt or hand-broken manifests, but every CLI call site let that escape
+    as a bare traceback with no output — the exit code was right only because
+    typer catches the exception. A user editing a manifest by hand should see the
+    reason, not a stack.
+    """
+    from trainyourface.liveness.dataset import DatasetManifest
+
+    try:
+        return DatasetManifest.load(path)
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(code=1) from exc
+
+
 # --------------------------------------------------------------------------
 # use it
 # --------------------------------------------------------------------------
@@ -194,14 +212,14 @@ def manifest(
     check: bool = typer.Option(True, help="Verify every listed image exists."),
 ) -> None:
     """Summarize a PAD dataset and check it's ready to train on."""
-    from trainyourface.liveness.dataset import DatasetManifest, subject_disjoint_split
+    from trainyourface.liveness.dataset import subject_disjoint_split
 
     path = data / "manifest.json"
     if not path.exists():
         typer.secho(f"no manifest at {path}. Run `tyf capture` first.", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
-    m = DatasetManifest.load(path)
+    m = _load_manifest(path)
     typer.echo(f"\n{m.describe()}\n")
 
     if check:
@@ -303,7 +321,6 @@ def train(
     """
     from trainyourface.eval.report import evaluate_checkpoint, render_report, save_report
     from trainyourface.liveness.dataset import (
-        DatasetManifest,
         check_split_integrity,
         split_fingerprint,
         subject_disjoint_split,
@@ -319,7 +336,7 @@ def train(
         )
         raise typer.Exit(code=1)
 
-    m = DatasetManifest.load(manifest_path)
+    m = _load_manifest(manifest_path)
     typer.echo(f"\n{m.describe()}\n")
 
     try:
@@ -405,7 +422,6 @@ def eval_cmd(
         render_report,
     )
     from trainyourface.liveness.dataset import (
-        DatasetManifest,
         check_split_integrity,
         subject_disjoint_split,
         verify_split_matches,
@@ -438,7 +454,7 @@ def eval_cmd(
         )
         raise typer.Exit(code=1)
 
-    m = DatasetManifest.load(manifest_path)
+    m = _load_manifest(manifest_path)
     try:
         train_s, val_s, test_s = subject_disjoint_split(m.samples, seed=seed, by=split_by)
         check_split_integrity(train_s, val_s, test_s, by=split_by)
@@ -491,7 +507,7 @@ def eval_cmd(
         )
         raise typer.Exit(code=1)
 
-    cross_m = DatasetManifest.load(cross_manifest)
+    cross_m = _load_manifest(cross_manifest)
     if not cross_m.samples:
         typer.secho(f"{cross_manifest} lists no samples", fg=typer.colors.RED)
         raise typer.Exit(code=1)

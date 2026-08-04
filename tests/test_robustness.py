@@ -526,3 +526,168 @@ class TestBoxScaledDegenerate:
     def test_normal_scaling_is_exact(self):
         out = box(10, 20, 110, 220).scaled(2.0, 0.5)
         assert (out.x1, out.y1, out.x2, out.y2) == (20, 10, 220, 110)
+
+
+class TestManifestPortability:
+    """A manifest is a committable, cross-machine artifact — so it must survive
+    the machine that wrote it.
+
+    SILENTLY WRONG: `tyf capture` built paths with `str(Path("images") / label /
+    name)`, which on Windows produces `images\\bona_fide\\s1_0.png`. Read back on
+    macOS or Linux that is a SINGLE filename containing backslashes, not a path:
+    every image read fails and the subject parser can't find the identity dir. The
+    project's whole premise is cross-platform, so a manifest that only works on the
+    OS that made it is a real defect.
+    """
+
+    def test_a_windows_path_is_normalized_on_construction(self):
+        from trainyourface.core.contracts import AttackType
+        from trainyourface.liveness.dataset import Sample
+
+        s = Sample(
+            path="images\\bona_fide\\s1_0.png", attack_type=AttackType.BONA_FIDE, subject="s"
+        )
+        assert s.path == "images/bona_fide/s1_0.png"
+
+    def test_a_posix_path_is_left_alone(self):
+        from trainyourface.core.contracts import AttackType
+        from trainyourface.liveness.dataset import Sample
+
+        s = Sample(path="images/bona_fide/s1_0.png", attack_type=AttackType.BONA_FIDE, subject="s")
+        assert s.path == "images/bona_fide/s1_0.png"
+
+    def test_a_windows_manifest_round_trips_to_forward_slashes(self, tmp_path):
+        from trainyourface.core.contracts import AttackType
+        from trainyourface.liveness.dataset import DatasetManifest, Sample
+
+        m = DatasetManifest(
+            samples=[Sample("Data\\train\\7\\live\\1.png", AttackType.BONA_FIDE, "7")],
+            root=str(tmp_path),
+        )
+        m.save(tmp_path / "manifest.json")
+        reloaded = DatasetManifest.load(tmp_path / "manifest.json")
+        assert reloaded.samples[0].path == "Data/train/7/live/1.png"
+
+    def test_a_windows_celeba_path_still_yields_its_subject(self):
+        """The subject parser splits on '/', so a normalized path is what lets it
+        find the identity directory regardless of the capture OS."""
+        from trainyourface.core.contracts import AttackType
+        from trainyourface.liveness.celeba_spoof import _subject_from_path
+        from trainyourface.liveness.dataset import Sample
+
+        s = Sample("Data\\train\\1234\\live\\1.png", AttackType.BONA_FIDE, "x")
+        assert _subject_from_path(s.path) == "1234"
+
+
+class TestManifestLoadValidation:
+    """A manifest gets hand-edited, script-generated, and git-merged, so "it
+    parsed" is not "it is usable".
+
+    CRASHES FAR FROM THE CAUSE: every malformed manifest used to surface as a raw
+    JSONDecodeError, KeyError, or AttributeError naming a dict key or a byte
+    offset. The worst was a non-dict `conditions`, which passed straight through
+    load() and died later inside `fairness_audit` as `'str' object has no attribute
+    'items'` — arbitrarily far from the file that caused it.
+    """
+
+    @staticmethod
+    def _write(tmp_path, content):
+        p = tmp_path / "manifest.json"
+        p.write_text(content)
+        return p
+
+    def test_corrupt_json_names_the_file(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        with pytest.raises(ValueError, match="not valid JSON"):
+            DatasetManifest.load(self._write(tmp_path, "hello{"))
+
+    def test_a_top_level_array_is_rejected(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        with pytest.raises(ValueError, match="must contain a JSON object"):
+            DatasetManifest.load(self._write(tmp_path, "[1, 2, 3]"))
+
+    def test_samples_must_be_a_list(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        with pytest.raises(ValueError, match="'samples' must be a list"):
+            DatasetManifest.load(self._write(tmp_path, '{"samples": "nope"}'))
+
+    def test_a_missing_required_field_names_it(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        content = '{"samples":[{"attack_type":"bona_fide","subject":"s"}]}'
+        with pytest.raises(ValueError, match="missing required field.*path"):
+            DatasetManifest.load(self._write(tmp_path, content))
+
+    def test_an_unknown_attack_type_lists_the_valid_ones(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        content = '{"samples":[{"path":"a.png","attack_type":"laser","subject":"s"}]}'
+        with pytest.raises(ValueError, match="not one of"):
+            DatasetManifest.load(self._write(tmp_path, content))
+
+    def test_non_dict_conditions_are_caught_at_load_not_in_the_report(self, tmp_path):
+        """The whole point: fail at the file, not three modules downstream."""
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        content = (
+            '{"samples":[{"path":"a.png","attack_type":"bona_fide","subject":"s",'
+            '"conditions":"attr:Male"}]}'
+        )
+        with pytest.raises(ValueError, match="'conditions' of type str"):
+            DatasetManifest.load(self._write(tmp_path, content))
+
+    def test_a_null_root_normalizes_to_empty_string(self, tmp_path):
+        """root=None would break image_root()'s Path(self.root). Coerced to ''."""
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        m = DatasetManifest.load(self._write(tmp_path, '{"root":null,"samples":[]}'))
+        assert m.root == ""
+        assert m.image_root(tmp_path) == tmp_path
+
+    def test_a_valid_manifest_still_loads(self, tmp_path):
+        from trainyourface.liveness.dataset import DatasetManifest
+
+        content = (
+            '{"root":"/x","samples":[{"path":"a.png","attack_type":"bona_fide","subject":"s"}]}'
+        )
+        m = DatasetManifest.load(self._write(tmp_path, content))
+        assert len(m.samples) == 1 and m.root == "/x"
+
+
+class TestCorruptManifestThroughTheCLI:
+    """A malformed manifest must be a message, not a traceback with no output.
+
+    The commands exited 1 only because typer catches the escaping ValueError; the
+    user saw a stack and no explanation. Someone hand-editing a manifest should be
+    told what's wrong with it.
+    """
+
+    def _bad(self, tmp_path):
+        (tmp_path / "manifest.json").write_text("hello{")
+        return tmp_path
+
+    def test_manifest_command_explains_it(self, tmp_path):
+        from typer.testing import CliRunner
+
+        from trainyourface.cli.main import app
+
+        result = CliRunner().invoke(app, ["manifest", "--data", str(self._bad(tmp_path))])
+        assert result.exit_code == 1
+        assert "not valid JSON" in result.output
+        assert not isinstance(result.exception, Exception) or isinstance(
+            result.exception, SystemExit
+        )
+
+    def test_train_command_explains_it(self, tmp_path):
+        from typer.testing import CliRunner
+
+        from trainyourface.cli.main import app
+
+        result = CliRunner().invoke(
+            app, ["train", "--data", str(self._bad(tmp_path)), "--epochs", "1"]
+        )
+        assert result.exit_code == 1
+        assert "not valid JSON" in result.output
