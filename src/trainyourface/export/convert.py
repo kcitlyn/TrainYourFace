@@ -58,9 +58,9 @@ def export_model(
 
     import torch
 
-    from trainyourface.liveness.model import ModelConfig, build_model
+    from trainyourface.liveness.model import ModelConfig, build_model, load_checkpoint
 
-    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    ckpt = load_checkpoint(checkpoint, map_location="cpu")
     cfg = ModelConfig(**ckpt["model_config"])
     model = build_model(cfg)
     model.load_state_dict(ckpt["model_state"])

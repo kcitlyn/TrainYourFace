@@ -37,7 +37,13 @@ from trainyourface.liveness.dataset import (
     Sample,
     class_weights,
 )
-from trainyourface.liveness.model import ModelConfig, build_model, count_parameters, pick_device
+from trainyourface.liveness.model import (
+    ModelConfig,
+    build_model,
+    count_parameters,
+    load_checkpoint,
+    pick_device,
+)
 
 
 @dataclass
@@ -246,7 +252,7 @@ def train(
                 break
 
     # Choose the deployment threshold on VALIDATION, never on test.
-    ckpt = torch.load(out_dir / "best.pt", map_location=device, weights_only=False)
+    ckpt = load_checkpoint(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model_state"])
     val_scores, val_labels, _ = _score_split(model, val_loader, device)
     _, val_threshold = equal_error_rate(val_scores, val_labels.astype(bool))

@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import urllib.error
 import urllib.request
 import zipfile
@@ -61,6 +60,32 @@ class ModelSpec:
     # Path inside the zip, if the download is an archive.
     archive_member: str | None = None
     archive_sha256: str | None = None
+
+
+# Hard ceiling on anything written to the model cache. The real artifacts total
+# ~17 MB, so 200 MB is ~10x headroom and still far below "filled the disk".
+#
+# This is NOT the primary defence — SHA-256 verification is, and it means a
+# tampered or truncated download can never produce a loadable model. The bound
+# closes a narrower gap: bytes are streamed to disk BEFORE the hash is checked, so
+# without a cap a hostile mirror or a decompression bomb could fill the cache
+# directory (or /tmp) even though the result would then be rejected. Cheap to
+# enforce, and it turns an unbounded write into a named error.
+MAX_ARTIFACT_BYTES = 200 * 1024 * 1024
+
+
+def _copy_bounded(src, dst, limit: int = MAX_ARTIFACT_BYTES, what: str = "download") -> None:
+    """Stream src -> dst, aborting past `limit` bytes."""
+    written = 0
+    while chunk := src.read(1 << 16):
+        written += len(chunk)
+        if written > limit:
+            raise ModelDownloadError(
+                f"{what} exceeded {limit // (1024 * 1024)} MB and was aborted. The "
+                "expected artifacts are ~17 MB total, so this is either a corrupted "
+                "source or a hostile one."
+            )
+        dst.write(chunk)
 
 
 # Detection + embedding both come from insightface's `buffalo_sc` pack: a 2.4 MB
@@ -153,7 +178,7 @@ def ensure_model(spec: ModelSpec, *, allow_download: bool = True) -> Path:
     tmp = dest.with_suffix(dest.suffix + ".partial")
     try:
         with urllib.request.urlopen(spec.url, timeout=120) as resp, tmp.open("wb") as out:
-            shutil.copyfileobj(resp, out)
+            _copy_bounded(resp, out, what=f"download of {spec.name}")
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         tmp.unlink(missing_ok=True)
         raise ModelDownloadError(
@@ -189,7 +214,9 @@ def ensure_model(spec: ModelSpec, *, allow_download: bool = True) -> Path:
                         f"{spec.archive_member} not found in archive; contains: {names}"
                     )
                 with zf.open(match) as src, dest.open("wb") as out:
-                    shutil.copyfileobj(src, out)
+                    # Bounded because the declared size in a zip header is
+                    # attacker-controlled; only the actual read is trustworthy.
+                    _copy_bounded(src, out, what=f"extraction of {spec.filename}")
         except zipfile.BadZipFile as exc:
             raise ModelDownloadError(f"{spec.url} is not a valid zip archive: {exc}") from exc
         finally:

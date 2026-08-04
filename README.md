@@ -288,7 +288,7 @@ the one worth quoting.
 ## Tests
 
 ```bash
-pytest                        # 435 tests
+pytest                        # 449 tests
 pytest -m train               # + the end-to-end run (trains a real model, ~3 min)
 pytest --cov=trainyourface    # 78% total
 ```
@@ -311,6 +311,41 @@ the bugs in this project were never "this function returns the wrong number" —
 Two things the tests deliberately don't claim: `cli/live.py` and `cli/capture.py` sit at
 0% because they need a physical camera, and the e2e liveness numbers are plumbing
 verification on synthetic data, not accuracy. Both are stated rather than papered over.
+
+---
+
+## Security
+
+A tool that handles biometric data and loads shared model files has a threat model,
+so here it is explicitly.
+
+**Loading a checkpoint does not execute it.** A PyTorch `.pt` file is a pickle, and
+`torch.load(..., weights_only=False)` runs whatever the file asks it to via
+`__reduce__`. This project used to do exactly that in four places, which mattered
+because `tyf eval --checkpoint` pointed at someone else's model is the documented way
+to reproduce a reported number — PAD checkpoints are precisely the kind of artifact
+people pass around. All loads now go through one function with `weights_only=True`,
+which refuses anything beyond tensors and plain data. A test builds a malicious
+checkpoint and asserts the payload never runs; another parses the source with `ast` to
+catch a reintroduced `weights_only=False`. The enrollment store likewise uses
+`np.load(allow_pickle=False)`.
+
+**Biometric templates are owner-only.** Face embeddings are regulated as biometric
+identifiers (GDPR Art. 9, BIPA) and unlike a password you cannot issue someone a new
+face. The store is written `0o600`, set before the atomic rename so it is never
+briefly world-readable, and re-applied on every save. Templates live outside the repo
+in a platform data dir, not behind a `.gitignore` entry that one `git add -f` defeats.
+
+**Downloads are hash-pinned, and bounded.** Both the archive and the extracted member
+are SHA-256 verified — computed from real downloads, not copied from docs — so a
+replaced upstream release or a truncated transfer can never yield a loadable model. Zip
+extraction pulls one named member rather than `extractall`, which sidesteps zip-slip.
+Streaming is capped at 200 MB (~10x the real 17 MB) because bytes reach disk *before*
+the hash is checked, so the cap is what stops a bomb or hostile mirror filling the
+cache even though the result would be rejected.
+
+**Liveness fails closed** — see the trust states above. And the network surface is one
+hardcoded HTTPS URL, fetched once; nothing phones home after that.
 
 ---
 
