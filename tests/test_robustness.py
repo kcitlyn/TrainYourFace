@@ -25,6 +25,8 @@ happen, which is why each one is pinned rather than fixed and forgotten.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -828,6 +830,17 @@ class TestBiometricDataAtRest:
     problem until someone passes `--store` somewhere else.
     """
 
+    # POSIX only. On Windows `os.chmod` can only toggle the read-only flag — the
+    # permission bits are emulated and always report group/other as readable
+    # (0o666), so asserting 0o600 there tests the emulation, not this code. The
+    # source comment already said this; the first version of these tests ignored it
+    # and failed both Windows jobs. Confidentiality on Windows rests on the user
+    # profile directory's ACL instead.
+    posix_only = pytest.mark.skipif(
+        os.name != "posix", reason="POSIX permission bits are emulated on Windows"
+    )
+
+    @posix_only
     def test_the_store_is_owner_only(self, tmp_path):
         import stat
 
@@ -842,6 +855,7 @@ class TestBiometricDataAtRest:
         assert not mode & stat.S_IROTH, "world-readable biometric templates"
         assert not mode & stat.S_IRGRP, "group-readable biometric templates"
 
+    @posix_only
     def test_permissions_survive_a_rewrite(self, tmp_path):
         """save() replaces the file, so the mode has to be reapplied each time."""
         import stat
@@ -855,6 +869,30 @@ class TestBiometricDataAtRest:
         s.add("b", np.ones((1, 512), dtype=np.float32))
         s.save()
         assert not stat.S_IMODE(path.stat().st_mode) & stat.S_IROTH
+
+    def test_the_chmod_is_attempted_on_every_platform(self, tmp_path, monkeypatch):
+        """Windows can't enforce the mode, but the call must still be made.
+
+        Skipping the two tests above on Windows would otherwise leave the chmod
+        itself untested there — so a refactor that dropped it would go unnoticed on
+        that platform. This asserts the attempt, which is platform-independent.
+        """
+        from pathlib import Path
+
+        from trainyourface.core.store import EnrollmentStore
+
+        seen: list[int] = []
+        real_chmod = Path.chmod
+
+        def spy(self, mode, **kwargs):
+            seen.append(mode)
+            return real_chmod(self, mode, **kwargs)
+
+        monkeypatch.setattr(Path, "chmod", spy)
+        s = EnrollmentStore(tmp_path / "enrollments.npz")
+        s.add("kc", np.zeros((1, 512), dtype=np.float32))
+        s.save()
+        assert 0o600 in seen, "save() must restrict the biometric store's mode"
 
     def test_the_store_still_round_trips(self, tmp_path):
         from trainyourface.core.store import EnrollmentStore
