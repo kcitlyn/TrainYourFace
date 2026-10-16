@@ -64,7 +64,7 @@ jobs:
         # can miss entirely since they import modules directly.
         run: |
           tyf --help
-          for cmd in watch enroll list forget capture manifest train eval calibrate export bench info; do
+          for cmd in watch enroll list forget capture manifest import-celeba train eval calibrate export bench info; do
             tyf "$cmd" --help > /dev/null || exit 1
           done
           echo "all subcommands resolve"

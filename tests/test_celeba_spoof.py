@@ -51,12 +51,15 @@ def vec(spoof_type: int, illum: int = 0, env: int = 0, live_flag: int | None = N
     return [0] * 40 + [spoof_type, illum, env, flag]
 
 
-def write_celeba(tmp_path, subjects=("1", "2", "3", "4"), per_class=2, with_images=True):
+def write_celeba(
+    tmp_path, subjects=("1", "2", "3", "4"), per_class=2, with_images=True, with_bb=True
+):
     """Build a miniature CelebA-Spoof tree: real PNGs plus a label JSON.
 
     Mirrors the real layout — `Data/train/<identity>/{live,spoof}/<n>.png` — because
     the subject parser reads the identity out of that path, and a fixture with a
-    flattened layout would test nothing.
+    flattened layout would test nothing. Each image gets a `_BB.txt` covering the
+    whole frame (in the 224 reference frame), like the real download.
     """
     import cv2
 
@@ -73,6 +76,8 @@ def write_celeba(tmp_path, subjects=("1", "2", "3", "4"), per_class=2, with_imag
                     p = root / rel
                     p.parent.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(p), np.full((128, 128, 3), 90 + code, np.uint8))
+                    if with_bb:
+                        (p.parent / f"{i}_BB.txt").write_text("0 0 224 224 0.99\n")
     meta = root / "metas" / "intra_test" / "train_label.json"
     meta.parent.mkdir(parents=True, exist_ok=True)
     meta.write_text(json.dumps(labels))
@@ -305,21 +310,254 @@ class TestImportCelebaCommand:
         assert (out / "manifest.json").exists()
         assert "ECCV 2020" in result.output, "the dataset's terms require citation"
 
-    def test_the_manifest_root_points_at_the_celeba_tree(self, tmp_path):
-        """Images live in the CelebA download, not beside the manifest. If root were
-        the output dir, every later image read would fail with a missing file.
+    def test_without_cropping_the_root_points_at_the_celeba_tree(self, tmp_path):
+        """With --no-crop the images stay in the CelebA download, not beside the
+        manifest. If root were the output dir, every image read would fail.
         """
         root = write_celeba(tmp_path)
         out = tmp_path / "out"
-        runner.invoke(app, ["import-celeba", str(root), "--out", str(out)])
+        result = runner.invoke(app, ["import-celeba", str(root), "--out", str(out), "--no-crop"])
+        assert result.exit_code == 0, result.output
         m = DatasetManifest.load(out / "manifest.json")
+        assert Path(m.root) == root.resolve()
         assert (Path(m.root) / m.samples[0].path).exists()
+
+    def test_no_crop_says_what_it_costs(self, tmp_path):
+        """Whole-image training is the mismatch cropping exists to remove, so opting
+        out of it is allowed but never silent."""
+        root = write_celeba(tmp_path)
+        result = runner.invoke(
+            app, ["import-celeba", str(root), "--out", str(tmp_path / "o"), "--no-crop"]
+        )
+        assert "will not describe the live pipeline" in result.output
+
+    def test_by_default_it_crops_into_the_output_dir(self, tmp_path):
+        root = write_celeba(tmp_path)
+        out = tmp_path / "out"
+        result = runner.invoke(app, ["import-celeba", str(root), "--out", str(out)])
+        assert result.exit_code == 0, result.output
+        m = DatasetManifest.load(out / "manifest.json")
+        assert Path(m.root) == out.resolve()
+        assert all(s.path.startswith("images") for s in m.samples)
+        assert all((out / s.path).exists() for s in m.samples)
+
+    def test_preview_writes_overlays_and_imports_nothing(self, tmp_path):
+        root = write_celeba(tmp_path)
+        out = tmp_path / "out"
+        result = runner.invoke(
+            app, ["import-celeba", str(root), "--out", str(out), "--preview", "4"]
+        )
+        assert result.exit_code == 0, result.output
+        assert len(list((out / "preview").glob("*.png"))) == 4
+        assert not (out / "manifest.json").exists()
+
+    def test_a_dataset_with_no_boxes_fails_with_an_exit_code(self, tmp_path):
+        root = write_celeba(tmp_path, with_bb=False)
+        result = runner.invoke(app, ["import-celeba", str(root), "--out", str(tmp_path / "o")])
+        assert result.exit_code == 1
+        assert "_BB.txt" in result.output
 
     def test_a_bad_directory_is_a_message_not_a_traceback(self, tmp_path):
         result = runner.invoke(app, ["import-celeba", str(tmp_path / "gone")])
         assert result.exit_code == 1
         assert "import failed" in result.output
         assert not isinstance(result.exception, FileNotFoundError)
+
+
+def _scene(tmp_path, rel="Data/train/7/spoof/000001.jpg", bb="100 60 40 80 0.97"):
+    """A non-square 448x224 scene with a bright 'face' at pixels x200-280, y60-140.
+
+    Non-square on purpose: the 224 reference frame is rescaled PER AXIS, and a
+    square fixture can't tell a per-axis rescale from a single-factor one. In the
+    reference frame the face is x=100 (200 * 224/448), w=40, y=60, h=80.
+    """
+    import cv2
+
+    root = tmp_path / "celeba"
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    img = np.zeros((224, 448, 3), np.uint8)
+    # Texture rather than a flat fill, so a misplaced crop can't match by accident.
+    rng = np.random.default_rng(0)
+    img[:] = rng.integers(0, 60, img.shape, dtype=np.uint8)
+    img[60:140, 200:280] = rng.integers(150, 255, (80, 80, 3), dtype=np.uint8)
+    cv2.imwrite(str(p), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
+    if bb is not None:
+        (p.parent / (p.stem + "_BB.txt")).write_text(bb + "\n")
+    return root, rel, cv2.imread(str(p))
+
+
+def _manifest_for(root, rel, attack=AttackType.REPLAY):
+    from trainyourface.liveness.dataset import Sample
+
+    return DatasetManifest(
+        samples=[
+            Sample(
+                path=rel,
+                attack_type=attack,
+                subject="7",
+                session="celeba",
+                instrument="phone",
+                conditions={"spoof_type": "phone", "illumination": "back"},
+            )
+        ],
+        root=str(root),
+    )
+
+
+class TestCropping:
+    """Imported CelebA images must be cropped exactly the way the runtime crops.
+
+    The whole point of this step is to remove a train/serve mismatch, so the
+    central test is byte-identity with what `LivenessModel.check` would feed the
+    model for the same face — not "the crop looks face-ish".
+    """
+
+    def test_bb_path_follows_the_official_naming(self):
+        from trainyourface.liveness.celeba_spoof import bb_path
+
+        assert bb_path("Data/train/1/live/000001.jpg").name == "000001_BB.txt"
+        assert bb_path("Data/train/1/live/000001.png").name == "000001_BB.txt"
+
+    def test_the_box_is_rescaled_per_axis_from_the_224_frame(self, tmp_path):
+        from trainyourface.liveness.celeba_spoof import read_bb
+
+        root, rel, img = _scene(tmp_path)
+        box = read_bb(root / rel, img.shape)
+        assert (box.x1, box.y1, box.x2, box.y2) == (200, 60, 280, 140)
+
+    def test_the_crop_is_byte_identical_to_the_runtime_crop(self, tmp_path):
+        """Same function, same margin, same size as LivenessModel.check."""
+        import cv2
+
+        from trainyourface.core.align import crop_box
+        from trainyourface.core.contracts import Box
+        from trainyourface.liveness.celeba_spoof import crop_dataset
+        from trainyourface.liveness.dataset import CROP_MARGIN, INPUT_SIZE
+
+        root, rel, img = _scene(tmp_path)
+        out = tmp_path / "out"
+        m = crop_dataset(_manifest_for(root, rel), out, log=lambda *a: None)
+
+        saved = cv2.imread(str(out / m.samples[0].path))
+        runtime = crop_box(
+            img, Box(x1=200, y1=60, x2=280, y2=140, score=0.97), size=INPUT_SIZE, margin=CROP_MARGIN
+        )
+        assert saved.shape == (INPUT_SIZE, INPUT_SIZE, 3)
+        np.testing.assert_array_equal(saved, runtime)
+
+    def test_the_crop_is_centred_on_the_face_not_the_frame(self, tmp_path):
+        """A sanity check with a visible signature: the bright face fills the
+        middle of the crop. A whole-image resize would be mostly dark."""
+        import cv2
+
+        from trainyourface.liveness.celeba_spoof import crop_dataset
+
+        root, rel, _ = _scene(tmp_path)
+        m = crop_dataset(_manifest_for(root, rel), tmp_path / "out", log=lambda *a: None)
+        crop = cv2.imread(str(tmp_path / "out" / m.samples[0].path))
+        assert crop[44:84, 44:84].mean() > 150
+
+    def test_labels_and_conditions_survive_cropping(self, tmp_path):
+        from trainyourface.liveness.celeba_spoof import crop_dataset
+
+        root, rel, _ = _scene(tmp_path)
+        s = crop_dataset(_manifest_for(root, rel), tmp_path / "out", log=lambda *a: None).samples[0]
+        assert s.attack_type is AttackType.REPLAY
+        assert s.subject == "7"
+        assert s.conditions == {"spoof_type": "phone", "illumination": "back"}
+        # The CelebA structure is kept, so the identity is still recoverable.
+        assert _subject_from_path(s.path) == "7"
+
+    def test_a_missing_box_is_skipped_not_cropped_as_the_whole_frame(self, tmp_path):
+        """Substituting the full image would put an uncropped sample into a cropped
+        dataset — the mismatch this step exists to remove."""
+        from trainyourface.liveness.celeba_spoof import crop_dataset
+
+        root, rel, _ = _scene(tmp_path, bb=None)
+        logged = []
+        with pytest.raises(ValueError, match="_BB.txt"):
+            crop_dataset(_manifest_for(root, rel), tmp_path / "out", log=logged.append)
+        assert any("missing box" in str(line) for line in logged)
+        assert not list((tmp_path / "out" / "images").rglob("*.png"))
+
+    def test_a_box_off_the_image_is_skipped_not_a_black_square(self, tmp_path):
+        from trainyourface.liveness.celeba_spoof import read_bb
+
+        root, rel, img = _scene(tmp_path, bb="300 300 20 20 0.9")
+        with pytest.raises(ValueError, match="no usable part"):
+            read_bb(root / rel, img.shape)
+
+    @pytest.mark.parametrize(
+        "bb", ["", "10 20", "a b c d 0.9", "10 10 0 40 0.9", "10 10 40 -5 0.9", "nan 1 2 3 1"]
+    )
+    def test_malformed_boxes_raise(self, tmp_path, bb):
+        from trainyourface.liveness.celeba_spoof import read_bb
+
+        root, rel, img = _scene(tmp_path, bb=bb)
+        with pytest.raises(ValueError):
+            read_bb(root / rel, img.shape)
+
+    def test_a_box_without_a_score_is_accepted(self, tmp_path):
+        from trainyourface.liveness.celeba_spoof import read_bb
+
+        root, rel, img = _scene(tmp_path, bb="100 60 40 80")
+        assert read_bb(root / rel, img.shape).score == 1.0
+
+    def test_skips_are_counted_alongside_successes(self, tmp_path):
+        from trainyourface.liveness.celeba_spoof import crop_dataset
+
+        root = write_celeba(tmp_path)
+        m = convert(root, log=lambda *a: None)
+        (root / "Data/train/1/live/0_BB.txt").unlink()
+        logged = []
+        cropped = crop_dataset(m, tmp_path / "out", log=lambda s: logged.append(str(s)))
+        assert len(cropped.samples) == len(m.samples) - 1
+        assert any("skipped 1 images: missing box" in line for line in logged)
+
+    def test_the_output_order_does_not_depend_on_worker_count(self, tmp_path):
+        from trainyourface.liveness.celeba_spoof import crop_dataset
+
+        root = write_celeba(tmp_path)
+        m = convert(root, log=lambda *a: None)
+        a = crop_dataset(m, tmp_path / "a", workers=1, log=lambda *a: None)
+        b = crop_dataset(m, tmp_path / "b", workers=8, log=lambda *a: None)
+        assert [s.path for s in a.samples] == [s.path for s in b.samples]
+
+    def test_a_rerun_reuses_existing_crops(self, tmp_path):
+        """A 600K-image pass that dies at 80% should not start over."""
+        from trainyourface.liveness.celeba_spoof import crop_dataset
+
+        root = write_celeba(tmp_path)
+        m = convert(root, log=lambda *a: None)
+        crop_dataset(m, tmp_path / "out", log=lambda *a: None)
+        logged = []
+        again = crop_dataset(m, tmp_path / "out", log=lambda s: logged.append(str(s)))
+        assert len(again.samples) == len(m.samples)
+        assert any(f"reused {len(m.samples)} crops" in line for line in logged)
+
+    def test_crops_made_with_other_parameters_are_not_mixed_in(self, tmp_path):
+        from trainyourface.liveness.celeba_spoof import CROP_INFO, crop_dataset
+
+        root = write_celeba(tmp_path)
+        m = convert(root, log=lambda *a: None)
+        out = tmp_path / "out"
+        crop_dataset(m, out, log=lambda *a: None)
+        info = json.loads((out / CROP_INFO).read_text())
+        info["margin"] = 0.1
+        (out / CROP_INFO).write_text(json.dumps(info))
+        with pytest.raises(ValueError, match="different parameters"):
+            crop_dataset(m, out, log=lambda *a: None)
+
+    def test_a_cropped_manifest_trains_through_the_split(self, tmp_path):
+        """The output must still be subject-disjoint-splittable."""
+        from trainyourface.liveness.celeba_spoof import crop_dataset
+        from trainyourface.liveness.dataset import check_split_integrity, subject_disjoint_split
+
+        root = write_celeba(tmp_path)
+        m = crop_dataset(convert(root, log=lambda *a: None), tmp_path / "o", log=lambda *a: None)
+        train, val, test = subject_disjoint_split(m.samples)
+        check_split_integrity(train, val, test)
 
 
 class TestStratify:

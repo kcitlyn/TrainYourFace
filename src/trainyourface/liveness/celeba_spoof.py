@@ -14,8 +14,10 @@ LICENSE
 -------
 Non-commercial research and educational use only, per the dataset's own terms.
 Nothing from it is redistributed by this project: the converter reads a copy you
-downloaded yourself and writes only a manifest of relative paths. Cite the paper
-if you publish numbers from it.
+downloaded yourself and writes a manifest plus face crops into your own local data
+directory (see `crop_dataset`). Don't commit or publish those crops — they are
+derived from the dataset and fall under its terms. Cite the paper if you publish
+numbers from it.
 
 THE ANNOTATION FORMAT
 ---------------------
@@ -51,6 +53,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
+import numpy as np
 
 from trainyourface.core.contracts import AttackType
 from trainyourface.liveness.dataset import DatasetManifest, Sample
@@ -409,3 +413,261 @@ def convert(
     manifest = DatasetManifest(samples=samples, root=str(root))
     log(f"built {len(samples)} samples across {kept_subjects} subjects")
     return manifest
+
+
+# ---------------------------------------------------------------------------
+# Face cropping
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS
+# ---------------
+# CelebA-Spoof images are not face crops. They are photos with a face somewhere in
+# them, and the dataset ships a `<image>_BB.txt` beside each one giving the face box.
+# The live pipeline never sees a whole photo: `LivenessModel.check` crops the
+# detected face with CROP_MARGIN and resizes to INPUT_SIZE. A model trained on whole
+# images resized to 128px would be scored on inputs it never sees at deployment —
+# the train/serve mismatch this project has already shipped once, in the
+# recognition path, and is built to prevent. So imported images are cropped with
+# the same `crop_box`, the same margin, and the same size the runtime uses.
+#
+# THE BOX FORMAT
+# --------------
+# Taken from the dataset authors' own loader (intra_dataset_code/client.py in the
+# CelebA-Spoof repo), not inferred: the box file is the image path with its
+# extension replaced by `_BB.txt`, its first line is `x y w h score`, and the
+# coordinates live in a 224x224 reference frame, rescaled per axis to the real
+# image size. `tyf import-celeba --preview` draws them so this can be checked by
+# eye on a real download.
+
+# The reference frame the `_BB.txt` coordinates are expressed in.
+BB_REFERENCE_SIZE = 224
+
+# Written beside the cropped images so a re-run can tell whether existing crops were
+# made with the same parameters. Reusing crops made with a different margin would
+# silently mix two preprocessing regimes in one dataset.
+CROP_INFO = "crop_info.json"
+
+
+def bb_path(image_path: Path | str) -> Path:
+    """`Data/train/1/live/000001.jpg` -> `Data/train/1/live/000001_BB.txt`."""
+    p = Path(image_path)
+    return p.with_name(p.stem + "_BB.txt")
+
+
+def read_bb(image_path: Path | str, image_shape: tuple[int, ...]):
+    """Read an image's face box and rescale it to pixel coordinates.
+
+    Returns a `Box` clipped to the image, or raises ValueError. Every failure is an
+    error rather than a fallback to the whole image: substituting the full frame
+    for a missing box would put an uncropped sample into a cropped dataset, which is
+    the mismatch this step exists to remove.
+    """
+    from trainyourface.core.contracts import Box
+
+    path = bb_path(image_path)
+    if not path.exists():
+        raise ValueError(f"no bounding-box file {path.name}")
+    first = path.read_text().strip().splitlines()
+    fields = first[0].split() if first else []
+    if len(fields) < 4:
+        raise ValueError(f"bounding box in {path.name} has {len(fields)} fields, expected 4+")
+    try:
+        x, y, w, h = (float(v) for v in fields[:4])
+        score = float(fields[4]) if len(fields) > 4 else 1.0
+    except ValueError:
+        raise ValueError(f"unparseable bounding box in {path.name}: {fields!r}") from None
+    if not all(np.isfinite(v) for v in (x, y, w, h)) or w <= 0 or h <= 0:
+        raise ValueError(f"degenerate bounding box in {path.name}: {fields[:4]}")
+
+    real_h, real_w = image_shape[:2]
+    sx, sy = real_w / BB_REFERENCE_SIZE, real_h / BB_REFERENCE_SIZE
+    x1, y1 = int(x * sx), int(y * sy)
+    x2, y2 = int((x + w) * sx), int((y + h) * sy)
+
+    # A box that misses the image entirely would make crop_box return an all-black
+    # square — a sample that trains the model on nothing, labelled as something.
+    cx1, cy1 = max(0, x1), max(0, y1)
+    cx2, cy2 = min(real_w, x2), min(real_h, y2)
+    if cx2 - cx1 < 2 or cy2 - cy1 < 2:
+        raise ValueError(
+            f"bounding box in {path.name} covers no usable part of the "
+            f"{real_w}x{real_h} image: {fields[:4]}"
+        )
+    return Box(x1=cx1, y1=cy1, x2=cx2, y2=cy2, score=min(1.0, max(0.0, score)))
+
+
+def _crop_one(src: Path, dest: Path, size: int, margin: float) -> str | None:
+    """Crop one image. Returns None on success, or the reason it was skipped."""
+    import cv2
+
+    from trainyourface.core.align import crop_box
+
+    img = cv2.imread(str(src), cv2.IMREAD_COLOR)
+    if img is None:
+        return "unreadable image"
+    try:
+        box = read_bb(src, img.shape)
+    except ValueError as exc:
+        return "missing box" if "no bounding-box file" in str(exc) else "bad box"
+    crop = crop_box(img, box, size=size, margin=margin)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(dest), crop):
+        return "write failed"
+    return None
+
+
+def crop_dataset(
+    manifest: DatasetManifest,
+    out_dir: Path | str,
+    *,
+    workers: int = 8,
+    log=print,
+) -> DatasetManifest:
+    """Crop every sample to the runtime's face crop and return a manifest over them.
+
+    Writes `<out_dir>/images/<original relative path>.png`, keeping the CelebA
+    directory structure so the subject stays recoverable from the path. The
+    returned manifest's root is `out_dir`, so it is self-contained and no longer
+    needs the original download.
+
+    Re-running into the same directory reuses crops already there — a 600K-image
+    pass that dies at 80% should not start over — but only if they were made with
+    the same parameters, which `crop_info.json` records.
+
+    Images with a missing or unusable box are skipped and counted, never cropped as
+    a whole frame.
+    """
+    import json as _json
+    from concurrent.futures import ThreadPoolExecutor
+
+    from trainyourface.liveness.dataset import CROP_MARGIN, INPUT_SIZE
+
+    src_root = Path(manifest.root)
+    out_dir = Path(out_dir)
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    params = {
+        "size": INPUT_SIZE,
+        "margin": CROP_MARGIN,
+        "bb_reference_size": BB_REFERENCE_SIZE,
+        "source": str(src_root.resolve()),
+    }
+    info_path = out_dir / CROP_INFO
+    if info_path.exists():
+        previous = _json.loads(info_path.read_text())
+        if previous != params:
+            raise ValueError(
+                f"{out_dir} already holds crops made with different parameters "
+                f"({previous}). Mixing them would put two preprocessing regimes in one "
+                "dataset; use a fresh --out directory."
+            )
+    info_path.write_text(_json.dumps(params, indent=2))
+
+    jobs = []
+    for s in manifest.samples:
+        rel = Path(s.path).with_suffix(".png")
+        jobs.append((s, rel, src_root / s.path, images_dir / rel))
+
+    def work(job):
+        _, _, src, dest = job
+        if dest.exists():
+            return "reused"
+        return _crop_one(src, dest, INPUT_SIZE, CROP_MARGIN)
+
+    kept: list[Sample] = []
+    skipped: dict[str, int] = {}
+    reused = 0
+    step = max(1, len(jobs) // 20)
+    # Threads, not processes: cv2 releases the GIL for decode/resize/encode, and
+    # threads avoid pickling 600K jobs. `map` preserves order, so the manifest is
+    # deterministic regardless of worker count.
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for i, (job, outcome) in enumerate(zip(jobs, pool.map(work, jobs), strict=True)):
+            sample, rel, _, _ = job
+            if outcome in (None, "reused"):
+                reused += outcome == "reused"
+                kept.append(
+                    Sample(
+                        path=str(Path("images") / rel),
+                        attack_type=sample.attack_type,
+                        subject=sample.subject,
+                        session=sample.session,
+                        instrument=sample.instrument,
+                        conditions=dict(sample.conditions),
+                    )
+                )
+            else:
+                skipped[outcome] = skipped.get(outcome, 0) + 1
+            if (i + 1) % step == 0 or i + 1 == len(jobs):
+                log(f"  cropped {i + 1}/{len(jobs)}")
+
+    for reason, count in sorted(skipped.items()):
+        log(f"  skipped {count} images: {reason}")
+    if reused:
+        log(f"  reused {reused} crops already in {images_dir}")
+    if not kept:
+        raise ValueError(
+            "cropped 0 images. Every image was skipped — check that the download "
+            "includes the *_BB.txt files beside the images."
+        )
+
+    log(f"cropped {len(kept)} faces to {INPUT_SIZE}px with {CROP_MARGIN:.0%} margin")
+    return DatasetManifest(samples=kept, root=str(out_dir.resolve()))
+
+
+def preview_boxes(
+    manifest: DatasetManifest, out_dir: Path | str, n: int = 20, log=print
+) -> list[Path]:
+    """Draw the face box and the margin crop on a few images, for checking by eye.
+
+    The box convention comes from the dataset authors' loader, but a convention
+    that is wrong for a particular download (a re-encoded mirror, a different
+    release) produces crops of foreheads and backgrounds with no error anywhere.
+    Twenty overlays is a minute of looking and rules that out.
+
+    Picks samples spread across subjects and both classes rather than the first n,
+    which would all be one person.
+    """
+    import cv2
+
+    from trainyourface.core.align import crop_box
+    from trainyourface.liveness.dataset import CROP_MARGIN, INPUT_SIZE
+
+    src_root = Path(manifest.root)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    samples = manifest.samples
+    stride = max(1, len(samples) // max(1, n))
+    picked = samples[::stride][:n]
+
+    written: list[Path] = []
+    for i, s in enumerate(picked):
+        src = src_root / s.path
+        img = cv2.imread(str(src), cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        try:
+            box = read_bb(src, img.shape)
+        except ValueError as exc:
+            log(f"  {s.path}: {exc}")
+            continue
+        view = img.copy()
+        dx, dy = int(box.width * CROP_MARGIN), int(box.height * CROP_MARGIN)
+        cv2.rectangle(view, (box.x1, box.y1), (box.x2, box.y2), (0, 255, 0), 2)
+        cv2.rectangle(
+            view, (box.x1 - dx, box.y1 - dy), (box.x2 + dx, box.y2 + dy), (0, 200, 255), 1
+        )
+        crop = crop_box(img, box, size=INPUT_SIZE, margin=CROP_MARGIN)
+        # Crop pasted top-left at its real training size, so the overlay shows both
+        # where the box sits and exactly what the model will be trained on.
+        h = min(INPUT_SIZE, view.shape[0])
+        w = min(INPUT_SIZE, view.shape[1])
+        view[:h, :w] = crop[:h, :w]
+        dest = out_dir / f"{i:02d}_{s.attack_type.value}_{s.subject}.png"
+        cv2.imwrite(str(dest), view)
+        written.append(dest)
+
+    log(f"wrote {len(written)} previews to {out_dir} (green = face box, orange = crop)")
+    return written

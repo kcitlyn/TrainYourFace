@@ -239,6 +239,18 @@ def import_celeba(
         False,
         help="Record CelebA face attributes so `tyf eval` can audit BPCER by group.",
     ),
+    crop: bool = typer.Option(
+        True,
+        "--crop/--no-crop",
+        help="Crop each face with its _BB.txt box, exactly as the live pipeline does. "
+        "--no-crop trains on whole images, which `tyf watch` never sees.",
+    ),
+    preview: int = typer.Option(
+        0,
+        min=0,
+        help="Write N box overlays to <out>/preview and stop, to check the crops by eye.",
+    ),
+    workers: int = typer.Option(8, min=1, help="Threads used for cropping."),
 ) -> None:
     """Convert a downloaded CelebA-Spoof dataset into a manifest.
 
@@ -246,8 +258,12 @@ def import_celeba(
     the only public PAD dataset that doesn't need a signed institutional
     agreement. Non-commercial research use only, per the dataset's terms; nothing
     from it is redistributed here.
+
+    By default each image is cropped to the face with the same margin and size the
+    live pipeline uses, and written under --out. Without that, the model would be
+    trained and scored on whole photos while deployment feeds it face crops.
     """
-    from trainyourface.liveness.celeba_spoof import convert
+    from trainyourface.liveness.celeba_spoof import convert, crop_dataset, preview_boxes
 
     try:
         m = convert(
@@ -261,10 +277,28 @@ def import_celeba(
         typer.secho(f"import failed: {exc}", fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
 
-    # Point the manifest's root at the CelebA tree so images resolve from wherever
-    # the manifest lands. Copying 625K images to sit beside it is not an option.
-    out.mkdir(parents=True, exist_ok=True)
     m.root = str(Path(root).resolve())
+    out.mkdir(parents=True, exist_ok=True)
+
+    if preview:
+        preview_boxes(m, out / "preview", n=preview, log=typer.echo)
+        typer.echo("check the overlays, then re-run without --preview to import")
+        return
+
+    if crop:
+        try:
+            m = crop_dataset(m, out, workers=workers, log=typer.echo)
+        except ValueError as exc:
+            typer.secho(f"import failed: {exc}", fg=typer.colors.RED)
+            raise typer.Exit(code=1) from exc
+    else:
+        # The manifest points into the CelebA tree; copying is not needed. But say
+        # plainly what this mode costs, since it is the mismatch cropping prevents.
+        typer.secho(
+            "WARNING: --no-crop trains on whole images, but `tyf watch` feeds the model "
+            "face crops. Metrics from this manifest will not describe the live pipeline.",
+            fg=typer.colors.YELLOW,
+        )
     m.save(out / "manifest.json")
 
     typer.echo(f"\n{m.describe()}\n")
