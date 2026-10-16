@@ -32,6 +32,25 @@ DEFAULT_RUN_DIR = Path("runs/liveness")
 DEFAULT_DATA_DIR = Path("data/pad")
 
 
+def _load_test_manifest(test_data: Path):
+    """Load an external test set's manifest, exiting 1 with the flag named if absent."""
+    from trainyourface.liveness.dataset import DatasetManifest
+
+    path = test_data / "manifest.json"
+    if not path.exists():
+        typer.secho(
+            f"no manifest at {path}. --test-data wants a dataset directory, e.g. one "
+            "made by `tyf import-celeba ... --label-file metas/intra_test/test_label.json`.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+    m = DatasetManifest.load(path)
+    if not m.samples:
+        typer.secho(f"{path} lists no samples", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    return m
+
+
 # --------------------------------------------------------------------------
 # use it
 # --------------------------------------------------------------------------
@@ -327,6 +346,11 @@ def train(
         "subject", help="'subject' or 'session'. Session is stricter.", metavar="MODE"
     ),
     device: str | None = typer.Option(None, help="cuda / mps / cpu. Auto-detected by default."),
+    test_data: Path | None = typer.Option(
+        None,
+        help="A separate dataset dir to use as the test set, e.g. CelebA-Spoof's official "
+        "test split. --data is then split into train/val only.",
+    ),
 ) -> None:
     """Train the liveness model, then evaluate it on a held-out test split.
 
@@ -334,13 +358,19 @@ def train(
     on validation and applied unchanged to test. Both are enforced here rather
     than left to the caller, because either one done wrong turns the reported
     numbers into noise that still looks good.
+
+    With --test-data, the test set is that dataset instead of a split of --data.
+    That is how a number becomes comparable with published results on a benchmark
+    that ships its own test split. It must share no subjects with --data.
     """
     from trainyourface.eval.report import evaluate_checkpoint, render_report, save_report
     from trainyourface.liveness.dataset import (
         DatasetManifest,
+        check_external_test,
         check_split_integrity,
         split_fingerprint,
         subject_disjoint_split,
+        train_val_split,
     )
     from trainyourface.liveness.model import ModelConfig
     from trainyourface.liveness.train import TrainConfig
@@ -356,16 +386,25 @@ def train(
     m = DatasetManifest.load(manifest_path)
     typer.echo(f"\n{m.describe()}\n")
 
+    test_m = _load_test_manifest(test_data) if test_data is not None else None
+
     try:
-        train_s, val_s, test_s = subject_disjoint_split(m.samples, seed=seed, by=split_by)
-        check_split_integrity(train_s, val_s, test_s, by=split_by)
+        if test_m is None:
+            train_s, val_s, test_s = subject_disjoint_split(m.samples, seed=seed, by=split_by)
+            check_split_integrity(train_s, val_s, test_s, by=split_by)
+        else:
+            train_s, val_s = train_val_split(m.samples, seed=seed, by=split_by)
+            test_s = test_m.samples
+            check_external_test(m.samples, test_s)
+            check_split_integrity(train_s, val_s, test_s, by=split_by)
     except ValueError as exc:
         typer.secho(f"split failed: {exc}", fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
 
+    source = f"external test set {test_data}" if test_m is not None else "test"
     typer.secho(
-        f"split by {split_by}: {len(train_s)} train / {len(val_s)} val / {len(test_s)} test "
-        "(disjoint, verified)",
+        f"split by {split_by}: {len(train_s)} train / {len(val_s)} val / {len(test_s)} "
+        f"{source} (disjoint, verified)",
         fg=typer.colors.CYAN,
     )
 
@@ -388,7 +427,13 @@ def train(
         config=cfg,
         # Recorded so `tyf eval` can verify it re-derived the same partition
         # instead of trusting that whoever ran it passed the same flags.
-        split=split_fingerprint(train_s, val_s, test_s, by=split_by),
+        split=split_fingerprint(
+            train_s,
+            val_s,
+            test_s,
+            by=split_by,
+            test_source=str(test_data.resolve()) if test_data is not None else None,
+        ),
     )
 
     # Test runs once, at the val-selected threshold. Iterating on this number is
@@ -397,7 +442,7 @@ def train(
     result = evaluate_checkpoint(
         out / "best.pt",
         test_s,
-        root=image_root,
+        root=test_m.image_root(test_data) if test_m is not None else image_root,
         threshold=summary["val_threshold"],
         device=device,
     )
@@ -419,6 +464,11 @@ def eval_cmd(
     cross: Path = typer.Option(
         None,
         help="A SECOND dataset dir to test on. Reports the in-domain vs out-of-domain gap.",
+    ),
+    test_data: Path | None = typer.Option(
+        None,
+        help="Score this dataset dir as the test set instead of a split of --data. "
+        "Required for a model trained with `tyf train --test-data`.",
     ),
 ) -> None:
     """Evaluate a checkpoint on the held-out test split.
@@ -473,19 +523,35 @@ def eval_cmd(
         raise typer.Exit(code=1)
 
     m = DatasetManifest.load(manifest_path)
-    try:
-        train_s, val_s, test_s = subject_disjoint_split(m.samples, seed=seed, by=split_by)
-        check_split_integrity(train_s, val_s, test_s, by=split_by)
-    except ValueError as exc:
-        typer.secho(f"split failed: {exc}", fg=typer.colors.RED)
-        raise typer.Exit(code=1) from exc
+    fingerprint = load_split(checkpoint.parent)
+
+    if test_data is not None:
+        train_s, test_s, test_root = _external_test_split(m, test_data, fingerprint)
+    elif fingerprint and fingerprint.get("test_source"):
+        # Re-deriving a test split from --data here would score the model on data
+        # it was never tested against — and, worse, on part of what it trained on,
+        # since with an external test set all of --data is train/val.
+        typer.secho(
+            f"this model was tested against an external test set "
+            f"({fingerprint['test_source']}). Pass it with --test-data; a split of "
+            "--data would contain subjects the model trained on.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+    else:
+        try:
+            train_s, val_s, test_s = subject_disjoint_split(m.samples, seed=seed, by=split_by)
+            check_split_integrity(train_s, val_s, test_s, by=split_by)
+        except ValueError as exc:
+            typer.secho(f"split failed: {exc}", fg=typer.colors.RED)
+            raise typer.Exit(code=1) from exc
+        test_root = m.image_root(data)
 
     # `--seed` and `--split-by` default to 0/"subject" no matter what training
     # used, so a mismatch silently re-partitions the data and puts trained-on
     # subjects into the "held-out" test set. The result still looks correct —
     # internally disjoint, normal-looking report — so it is checked, not assumed.
-    fingerprint = load_split(checkpoint.parent)
-    if fingerprint:
+    if test_data is None and fingerprint:
         try:
             verify_split_matches(fingerprint, test_s, by=split_by)
         except ValueError as exc:
@@ -496,14 +562,14 @@ def eval_cmd(
             f"{fingerprint['by']}s, verified)",
             fg=typer.colors.CYAN,
         )
-    else:
+    elif test_data is None:
         typer.secho(
             "no split recorded beside this checkpoint; cannot verify the test set "
             "is the one held out during training.",
             fg=typer.colors.YELLOW,
         )
 
-    result = evaluate_checkpoint(checkpoint, test_s, root=m.image_root(data), threshold=thr)
+    result = evaluate_checkpoint(checkpoint, test_s, root=test_root, threshold=thr)
     if markdown:
         typer.echo(render_markdown_table(result))
     else:
@@ -553,6 +619,42 @@ def eval_cmd(
             result, cross_result, source_name=data.name or "train set", target_name=cross.name
         )
     )
+
+
+def _external_test_split(m, test_data: Path, fingerprint: dict | None):
+    """Resolve and verify an external test set for `tyf eval --test-data`.
+
+    Returns (training pool, test samples, test image root). With an external test
+    set nothing in --data was held out, so the whole of --data is the pool the test
+    set must not share subjects with.
+    """
+    from trainyourface.liveness.dataset import check_external_test, verify_split_matches
+
+    test_m = _load_test_manifest(test_data)
+    try:
+        check_external_test(m.samples, test_m.samples)
+    except ValueError as exc:
+        typer.secho(f"test set rejected: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(code=1) from exc
+
+    if fingerprint and fingerprint.get("test_source"):
+        try:
+            verify_split_matches(fingerprint, test_m.samples, by=fingerprint["by"])
+        except ValueError as exc:
+            typer.secho(f"\nSPLIT MISMATCH: {exc}", fg=typer.colors.RED)
+            raise typer.Exit(code=1) from exc
+        typer.secho(
+            f"test set matches the one used at training ({len(fingerprint['test'])} "
+            f"{fingerprint['by']}s, verified; no subjects shared with --data)",
+            fg=typer.colors.CYAN,
+        )
+    else:
+        typer.secho(
+            "test set shares no subjects with --data (verified), but this checkpoint "
+            "records no external test set, so it was not the one used at training.",
+            fg=typer.colors.YELLOW,
+        )
+    return m.samples, test_m.samples, test_m.image_root(test_data)
 
 
 @app.command()

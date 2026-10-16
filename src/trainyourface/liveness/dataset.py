@@ -260,22 +260,108 @@ def subject_disjoint_split(
     return train, val, test
 
 
+def train_val_split(
+    samples: list[Sample],
+    val_fraction: float = 0.2,
+    seed: int = 0,
+    by: str = "subject",
+) -> tuple[list[Sample], list[Sample]]:
+    """Split into train and validation only, for when the test set is external.
+
+    CelebA-Spoof ships an official test split (`test_label.json`) whose subjects
+    are disjoint from its training split. Evaluating on that, rather than on a test
+    split carved out of the training labels, is what makes a number comparable with
+    published results. In that mode the training manifest still needs a validation
+    split — the threshold and the checkpoint are chosen on it — but nothing is held
+    back for test, because test arrives separately.
+
+    Same group-level guarantees as `subject_disjoint_split`: no subject (or
+    session) spans train and val.
+    """
+    if by not in ("subject", "session"):
+        raise ValueError(f"`by` must be 'subject' or 'session', got {by!r}")
+    if not samples:
+        raise ValueError("cannot split an empty sample list")
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
+
+    key = (lambda s: s.subject) if by == "subject" else (lambda s: f"{s.subject}/{s.session}")
+    groups: dict[str, list[Sample]] = defaultdict(list)
+    for s in samples:
+        groups[key(s)].append(s)
+
+    names = sorted(groups)
+    if len(names) < 2:
+        raise ValueError(
+            f"need at least 2 {by}s for a disjoint train/val split, got {len(names)}: {names}"
+        )
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(names)
+    n_val = min(len(names) - 1, max(1, int(round(len(names) * val_fraction))))
+    val_names = set(names[:n_val])
+
+    train, val = [], []
+    for name in names:
+        (val if name in val_names else train).extend(groups[name])
+    return train, val
+
+
+def check_external_test(pool: list[Sample], test: list[Sample]) -> None:
+    """Refuse an external test set that shares people with the training data.
+
+    `pool` is everything the model could have trained on — the whole training
+    manifest, since with an external test set nothing in it is held out. Checked by
+    SUBJECT regardless of `--split-by`: a person who appears in training under a
+    different session is still a person the model has seen, and "held-out test set"
+    is a claim about people.
+
+    An error, not a warning. The cross-dataset path only warns on shared IDs because
+    two unrelated datasets can number their subjects the same way; an external TEST
+    split is supposed to come from the same labelling scheme, so a shared ID there
+    is a leak.
+    """
+    if not test:
+        raise ValueError("the external test set is empty")
+    shared = {s.subject for s in pool} & {s.subject for s in test}
+    if shared:
+        raise ValueError(
+            f"LEAKAGE: {len(shared)} subject(s) appear in both the training data and the "
+            f"test set: {sorted(shared)[:5]}. Metrics on this test set would be invalid."
+        )
+    labels = {s.label for s in test}
+    if len(labels) < 2:
+        only = "attack" if 1 in labels else "bona-fide"
+        raise ValueError(f"the test set contains only {only} samples; PAD metrics need both")
+
+
 def split_fingerprint(
-    train: list[Sample], val: list[Sample], test: list[Sample], by: str = "subject"
+    train: list[Sample],
+    val: list[Sample],
+    test: list[Sample],
+    by: str = "subject",
+    test_source: str | None = None,
 ) -> dict:
     """Record exactly which groups landed in which split.
 
     Written next to a checkpoint at train time so `tyf eval` can prove it is
     scoring the same held-out data, rather than assuming it. See
     `verify_split_matches` for why assuming is not good enough.
+
+    `test_source` names an external test manifest when the test set did not come
+    from splitting the training data. `tyf eval` then knows to ask for it rather
+    than re-deriving a test split the model never used.
     """
     key = (lambda s: s.subject) if by == "subject" else (lambda s: f"{s.subject}/{s.session}")
-    return {
+    fingerprint = {
         "by": by,
         "train": sorted({key(s) for s in train}),
         "val": sorted({key(s) for s in val}),
         "test": sorted({key(s) for s in test}),
     }
+    if test_source is not None:
+        fingerprint["test_source"] = test_source
+    return fingerprint
 
 
 def verify_split_matches(fingerprint: dict, test: list[Sample], by: str = "subject") -> None:
