@@ -206,16 +206,23 @@ def roc_curve(
     uniq = np.unique(scores_arr)
     thresholds = np.concatenate([[-np.inf], uniq, [np.inf]])
 
-    attack_scores = scores_arr[attack_mask]
-    bona_scores = scores_arr[~attack_mask]
+    attack_scores = np.sort(scores_arr[attack_mask])
+    bona_scores = np.sort(scores_arr[~attack_mask])
 
-    # Vectorized over thresholds: (n_thresh, 1) vs (1, n_samples) broadcast.
+    # Counted by binary search over the sorted scores: for each threshold t,
+    # searchsorted(side="left") is the number of scores strictly below t. That is
+    # O((n + t) log n) time and O(n) memory. The previous version broadcast
+    # thresholds against samples, an (n_thresh x n_samples) boolean matrix: fine
+    # on a few hundred captures, but on CelebA-Spoof's ~99K validation images it
+    # is ~10 GB, built once per epoch, and training dies at the end of epoch 0.
     if attack_scores.size:
-        apcer = (attack_scores[None, :] < thresholds[:, None]).mean(axis=1)
+        below = np.searchsorted(attack_scores, thresholds, side="left")
+        apcer = below / attack_scores.size
     else:
         apcer = np.zeros_like(thresholds)
     if bona_scores.size:
-        bpcer = (bona_scores[None, :] >= thresholds[:, None]).mean(axis=1)
+        below = np.searchsorted(bona_scores, thresholds, side="left")
+        bpcer = (bona_scores.size - below) / bona_scores.size
     else:
         bpcer = np.zeros_like(thresholds)
 

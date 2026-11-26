@@ -155,6 +155,12 @@ tyf train --epochs 30
 `--attributes` carries the CelebA face-attribute labels into the manifest, which is what
 makes the per-group BPCER audit below possible. It costs nothing at train time.
 
+At this scale, image loading, not the GPU, is the usual bottleneck. `tyf train --workers N`
+(and `tyf eval --workers N`) sets how many processes load images. The default is 2.
+Augmentation is seeded per image, so the worker count changes speed, not the trained
+model. On WSL, keep the dataset on the Linux filesystem rather than `/mnt/c`, where
+reading many small files is several times slower.
+
 **Your own camera.** The benchmark can't tell you whether the model survives *your*
 hardware.
 

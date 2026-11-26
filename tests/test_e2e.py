@@ -297,6 +297,29 @@ class TestEvalStage:
         assert f"{report['eer'] * 100:6.2f}%" in result.output
         assert f"{report['auc']:6.4f}" in result.output
 
+    def test_worker_count_does_not_change_the_scores(self, dataset, trained):
+        """`--workers` is a speed knob only. The loader keeps sample order and
+        scores are matched to samples by position, so a worker count that
+        reordered anything would misattribute scores and still print a report."""
+        out, _ = trained
+        outputs = []
+        for workers in ("0", "3"):
+            result = runner.invoke(
+                app,
+                [
+                    "eval",
+                    "--checkpoint",
+                    str(out / "best.pt"),
+                    "--data",
+                    str(dataset),
+                    "--workers",
+                    workers,
+                ],
+            )
+            assert result.exit_code == 0, result.output
+            outputs.append(result.output)
+        assert outputs[0] == outputs[1]
+
     def test_eval_confirms_the_split_matches_training(self, dataset, trained):
         out, _ = trained
         result = runner.invoke(

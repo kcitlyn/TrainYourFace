@@ -177,6 +177,41 @@ class TestRocAndAuc:
         assert np.all(np.diff(apcer) >= -1e-12)
         assert np.all(np.diff(bpcer) <= 1e-12)
 
+    def test_roc_matches_brute_force_definition(self):
+        """The sorted-count ROC must equal the definition, computed the slow way.
+
+        Scores are rounded to two decimals so most values are tied, which is the
+        case a binary search gets wrong if it uses the wrong side: an attack
+        scoring exactly the threshold is CALLED an attack (score >= threshold),
+        so it must not count toward APCER.
+        """
+        rng = np.random.default_rng(7)
+        scores = np.round(rng.random(500), 2)
+        is_attack = rng.random(500) > 0.6
+        thr, apcer, bpcer = roc_curve(scores, is_attack)
+
+        attack, bona = scores[is_attack], scores[~is_attack]
+        expected_apcer = [(attack < t).mean() for t in thr]
+        expected_bpcer = [(bona >= t).mean() for t in thr]
+        np.testing.assert_array_equal(apcer, expected_apcer)
+        np.testing.assert_array_equal(bpcer, expected_bpcer)
+
+    def test_roc_scales_to_a_real_benchmark(self):
+        """A CelebA-Spoof-sized split must not build a thresholds x samples matrix.
+
+        At 200K distinct scores the old broadcast was a 40 GB boolean array.
+        Training scores the validation split every epoch, so this is the
+        difference between finishing a run and dying at the end of epoch 0.
+        """
+        rng = np.random.default_rng(0)
+        n = 200_000
+        is_attack = rng.random(n) > 0.25
+        # Separable-ish scores: attacks centered high, bona fide low.
+        scores = np.clip(rng.normal(np.where(is_attack, 0.7, 0.3), 0.15), 0.0, 1.0)
+        eer, thr = equal_error_rate(scores, is_attack)
+        assert 0.0 < eer < 0.2
+        assert 0.3 < thr < 0.7
+
 
 class TestEER:
     def test_eer_perfect_is_zero(self):

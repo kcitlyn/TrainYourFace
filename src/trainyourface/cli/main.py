@@ -346,6 +346,12 @@ def train(
         "subject", help="'subject' or 'session'. Session is stricter.", metavar="MODE"
     ),
     device: str | None = typer.Option(None, help="cuda / mps / cpu. Auto-detected by default."),
+    workers: int = typer.Option(
+        2,
+        min=0,
+        help="Processes loading and augmenting images. Raise it on a many-core machine; "
+        "loading, not the GPU, is usually the bottleneck. Results don't depend on it.",
+    ),
     test_data: Path | None = typer.Option(
         None,
         help="A separate dataset dir to use as the test set, e.g. CelebA-Spoof's official "
@@ -414,6 +420,7 @@ def train(
         learning_rate=learning_rate,
         seed=seed,
         device=device,
+        num_workers=workers,
         model=ModelConfig(width=width),
     )
     # The manifest knows where its images live; --data is only the fallback. An
@@ -445,6 +452,7 @@ def train(
         root=test_m.image_root(test_data) if test_m is not None else image_root,
         threshold=summary["val_threshold"],
         device=device,
+        num_workers=workers,
     )
     typer.echo(render_report(result, title="Test Set (subject-disjoint)"))
     save_report(result, out / "test_report.json")
@@ -469,6 +477,12 @@ def eval_cmd(
         None,
         help="Score this dataset dir as the test set instead of a split of --data. "
         "Required for a model trained with `tyf train --test-data`.",
+    ),
+    workers: int = typer.Option(
+        2,
+        min=0,
+        help="Processes loading and augmenting images. Raise it on a many-core machine; "
+        "loading, not the GPU, is usually the bottleneck. Results don't depend on it.",
     ),
 ) -> None:
     """Evaluate a checkpoint on the held-out test split.
@@ -569,7 +583,9 @@ def eval_cmd(
             fg=typer.colors.YELLOW,
         )
 
-    result = evaluate_checkpoint(checkpoint, test_s, root=test_root, threshold=thr)
+    result = evaluate_checkpoint(
+        checkpoint, test_s, root=test_root, threshold=thr, num_workers=workers
+    )
     if markdown:
         typer.echo(render_markdown_table(result))
     else:
@@ -611,7 +627,11 @@ def eval_cmd(
         )
 
     cross_result = evaluate_checkpoint(
-        checkpoint, cross_m.samples, root=cross_m.image_root(cross), threshold=thr
+        checkpoint,
+        cross_m.samples,
+        root=cross_m.image_root(cross),
+        threshold=thr,
+        num_workers=workers,
     )
     typer.echo(render_report(cross_result, title=f"Cross-dataset: {cross.name} (never trained on)"))
     typer.echo(

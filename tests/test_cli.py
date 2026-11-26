@@ -292,6 +292,12 @@ class TestTrainGuardRails:
         result = runner.invoke(app, ["train", "--data", str(tmp_path), "--epochs", "0"])
         assert result.exit_code != 0
 
+    @pytest.mark.parametrize("cmd", ["train", "eval"])
+    def test_negative_workers_is_rejected(self, tmp_path, cmd):
+        result = runner.invoke(app, [cmd, "--data", str(tmp_path), "--workers", "-1"])
+        assert result.exit_code != 0
+        assert "workers" in result.output
+
 
 class TestEvalGuardRails:
     """`eval` used to let two failures escape as raw tracebacks.

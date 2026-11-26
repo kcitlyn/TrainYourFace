@@ -390,8 +390,13 @@ def evaluate_checkpoint(
     threshold: float,
     batch_size: int = 64,
     device: str | None = None,
+    num_workers: int = 0,
 ) -> dict:
-    """Load a checkpoint and evaluate it on a sample list."""
+    """Load a checkpoint and evaluate it on a sample list.
+
+    `num_workers` only changes how fast images are read: the loader keeps sample
+    order, and scores are matched to samples by position.
+    """
     import torch
     from torch.utils.data import DataLoader
 
@@ -406,7 +411,9 @@ def evaluate_checkpoint(
     model.eval()
 
     ds = PADDataset(samples, root=root, train=False, size=cfg.input_size)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    loader = DataLoader(
+        ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=num_workers
+    )
 
     scores: list[np.ndarray] = []
     with torch.no_grad():
